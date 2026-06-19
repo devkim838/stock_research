@@ -37,19 +37,20 @@ def build_top_news_lines(report_data: dict | None = None) -> list[str]:
         description = data.get("headline_description", DATA_MISSING)
         published_at = data.get("published_at", DATA_MISSING)
         source = data.get("source", DATA_MISSING)
+        collection_path = data.get("collection_path", DATA_MISSING)
         url = data.get("url", DATA_MISSING)
         if headline == DATA_MISSING:
             continue
         if url != DATA_MISSING:
             if description != DATA_MISSING:
-                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at} | {description}"
+                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at} | {collection_path} | {description}"
             else:
-                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at}"
+                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at} | {collection_path}"
         else:
             if description != DATA_MISSING:
-                text = f"  - {sector}: {headline} | {source} | {published_at} | {description}"
+                text = f"  - {sector}: {headline} | {source} | {published_at} | {collection_path} | {description}"
             else:
-                text = f"  - {sector}: {headline} | {source} | {published_at}"
+                text = f"  - {sector}: {headline} | {source} | {published_at} | {collection_path}"
         items.append((published_at, text))
     items.sort(key=lambda item: item[0], reverse=True)
     return [item[1] for item in items[:3]]
@@ -63,6 +64,7 @@ def build_coverage_section(report_data: dict | None = None) -> str:
         f"- FRED: {coverage.get('fred_status', DATA_MISSING)}",
         f"- NewsAPI: {coverage.get('news_status', DATA_MISSING)}",
         f"- MarketAux: {coverage.get('marketaux_status', DATA_MISSING)}",
+        f"- Massive: {coverage.get('massive_status', DATA_MISSING)}",
         f"- Alpha Vantage: {coverage.get('alpha_status', DATA_MISSING)}",
         f"- DART: {coverage.get('dart_status', DATA_MISSING)}",
         f"- KRX(KOSPI 지수): {coverage.get('krx_status', DATA_MISSING)}",
@@ -80,6 +82,7 @@ def build_common_sections(report_data: dict | None = None) -> str:
     market_summary = common.get("market_summary", {})
     fred = common.get("fred", {})
     rates = common.get("rates", {})
+    fx_commodities = common.get("fx_commodities", {})
     korea_market = common.get("korea_market", {})
     flow = common.get("flow", {})
     missing_reasons = common.get("missing_reasons", {})
@@ -99,6 +102,12 @@ def build_common_sections(report_data: dict | None = None) -> str:
         f"- 실업률: {fred.get('unemployment', {}).get('text', DATA_MISSING)}",
         f"- 연방기금금리: {fred.get('fed_funds', {}).get('text', DATA_MISSING)}",
         f"- 금리 변화 해석: {rates.get('analysis', ANALYSIS_PENDING)}",
+        "",
+        "## 환율/원자재",
+        "",
+        f"- 원/달러 환율: {fx_commodities.get('usdkrw', DATA_MISSING)}",
+        f"- 금 시세: {fx_commodities.get('gold', DATA_MISSING)}",
+        f"- 해석: {fx_commodities.get('analysis', ANALYSIS_PENDING)}",
         "",
         "## 한국시장",
         "",
@@ -165,12 +174,16 @@ def build_sector_section(title: str, related_stocks: Iterable[str], data: dict |
         f"- 원문 제목: {data.get('headline_original', DATA_MISSING)}",
         f"- 본문 요약: {data.get('headline_description', DATA_MISSING)}",
         f"- 출처: {data.get('source', DATA_MISSING)}",
+        f"- 수집 경로: {data.get('collection_path', DATA_MISSING)}",
         f"- 발행일: {data.get('published_at', DATA_MISSING)}",
         f"- URL: {data.get('url', DATA_MISSING)}",
         f"- 주가 영향: {data.get('price_impact', ANALYSIS_PENDING)}",
         f"- 단기 영향: {data.get('short_term', ANALYSIS_PENDING)}",
         f"- 중장기 영향: {data.get('medium_term', ANALYSIS_PENDING)}",
         f"- 관련 종목: {related}",
+        f"- 주요 일정/실적 발표: {data.get('schedule', DATA_MISSING)}",
+        f"- 일정 상세: {data.get('schedule_detail', DATA_MISSING)}",
+        f"- 일정 해석: {data.get('schedule_view', ANALYSIS_PENDING)}",
         f"- 투자 판단: {data.get('investment_judgment', ANALYSIS_PENDING)}",
         f"- 주의할 점: {data.get('risk', ANALYSIS_PENDING)}",
     ]

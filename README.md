@@ -1,6 +1,6 @@
 # A century-long plan
 
-실제 데이터 기반 투자 리서치 시스템입니다. Python 3.11 기준으로 오전, 오후, 마감 리포트를 자동 생성하며, `FRED`, `NewsAPI`, `MarketAux`, `Alpha Vantage`, `DART` 데이터를 사용합니다.
+실제 데이터 기반 투자 리서치 시스템입니다. Python 3.11 기준으로 오전, 오후, 마감 리포트를 자동 생성하며, `FRED`, `NewsAPI`, `MarketAux`, `Massive`, `Alpha Vantage`, `DART` 데이터를 사용합니다.
 
 ## 구조
 
@@ -16,6 +16,7 @@
 - `FRED`: [FRED API](https://fred.stlouisfed.org/docs/api/api_key.html)에서 API 키 발급
 - `NewsAPI`: [NewsAPI](https://newsapi.org/register)에서 계정 생성 후 키 발급
 - `MarketAux`: [MarketAux](https://www.marketaux.com/)에서 API 키 발급
+- `Massive`: [Massive](https://massive.com/)에서 API 키 발급
 - `Alpha Vantage`: [Alpha Vantage](https://www.alphavantage.co/support/#api-key)에서 무료 키 발급
 - `DART`: [OPEN DART](https://opendart.fss.or.kr/)에서 인증키 발급
 
@@ -27,6 +28,7 @@
 FRED_API_KEY=...
 NEWS_API_KEY=...
 MARKETAUX_API_KEY=...
+MASSIVE_API_KEY=...
 ALPHA_VANTAGE_API_KEY=...
 DART_API_KEY=...
 ```
@@ -80,7 +82,8 @@ python3 scripts/generate_research.py all-daily --overwrite
 
 - `FRED`: 미국 10년물 금리, CPI, PPI, 실업률, 연방기금금리
 - `Alpha Vantage`: 현대차 현재가, 전일 종가, 거래량, 52주 고가, 52주 저가
-- `NewsAPI` + `MarketAux`: 반도체, AI, 로봇, 자동차/현대차, 바이오/헬스케어, ETF 섹터 뉴스
+- `NewsAPI` + `MarketAux`: 기본 섹터 뉴스 수집
+- `Massive`: `MarketAux` 한도 초과 시 `/v2/reference/news` fallback 뉴스 수집
 - `DART`: 현대차, 삼성전자, 디앤디파마텍 최근 공시
 
 ## 데이터 미수집으로 남는 항목

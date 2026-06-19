@@ -17,6 +17,12 @@ enabled_env = "MARKETAUX_API_KEY"
 language = "en"
 limit = 10
 
+[api.massive]
+base_url = "https://api.massive.com"
+enabled_env = "MASSIVE_API_KEY"
+reference_news_path = "/v2/reference/news"
+limit = 50
+
 [api.krx]
 base_url = "https://data-dbg.krx.co.kr"
 enabled_env = "KRX_API_KEY"
@@ -38,6 +44,8 @@ cpi = "CPIAUCSL"
 ppi = "PPIACO"
 unemployment = "UNRATE"
 fed_funds = "FEDFUNDS"
+usdkrw = "DEXKOUS"
+gold = "GOLDAMGBD228NLBM"
 
 [market_data.news_queries]
 "반도체" = "(semiconductor OR HBM OR memory chip OR foundry OR SK hynix OR Samsung Electronics)"

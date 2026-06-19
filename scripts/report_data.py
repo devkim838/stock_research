@@ -30,6 +30,7 @@ FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 ALPHA_BASE_URL = "https://www.alphavantage.co/query"
 NEWS_API_BASE_URL = "https://newsapi.org/v2/everything"
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
+YAHOO_CHART_BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 
@@ -48,6 +49,15 @@ MARKETAUX_SEARCH_QUERIES = {
     "로봇": "\"humanoid robot\" OR robotics",
     "자동차/현대차": "Hyundai EV",
     "바이오/헬스케어": "FDA drug approval",
+    "ETF: SCHD, QQQM, SPYG": "SCHD",
+}
+
+MASSIVE_SECTOR_TICKERS = {
+    "반도체": "TSM",
+    "AI": "MSFT",
+    "로봇": "TSLA",
+    "자동차/현대차": "TSLA",
+    "바이오/헬스케어": "LLY",
     "ETF: SCHD, QQQM, SPYG": "SCHD",
 }
 
@@ -152,6 +162,14 @@ AUTO_STOCK_CANDIDATES = {
     "바이오/헬스케어": ["삼성바이오로직스", "셀트리온", "유한양행"],
 }
 
+SECTOR_DART_COMPANIES = {
+    "반도체": ["삼성전자", "SK하이닉스", "한미반도체"],
+    "AI": ["NAVER", "카카오"],
+    "로봇": ["레인보우로보틱스", "두산로보틱스", "로보스타"],
+    "자동차/현대차": ["현대자동차", "기아", "현대모비스", "현대오토에버"],
+    "바이오/헬스케어": ["삼성바이오로직스", "셀트리온", "유한양행", "디앤디파마텍"],
+}
+
 
 @dataclass(frozen=True)
 class NewsItem:
@@ -161,6 +179,7 @@ class NewsItem:
     source: str
     published_at: str
     url: str
+    provider: str
 
 
 @dataclass(frozen=True)
@@ -235,6 +254,7 @@ class ApiClient:
         self.fred_key = os.getenv("FRED_API_KEY")
         self.news_key = os.getenv("NEWS_API_KEY")
         self.marketaux_key = os.getenv(CONFIG["api"]["marketaux"]["enabled_env"])
+        self.massive_key = os.getenv(CONFIG["api"]["massive"]["enabled_env"])
         self.alpha_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         self.dart_key = os.getenv("DART_API_KEY")
         self.krx_key = os.getenv(CONFIG["api"]["krx"]["enabled_env"])
@@ -243,6 +263,10 @@ class ApiClient:
         self.kis_access_token: str | None = None
         self._corp_code_map: dict[str, str] | None = None
         self.krx_last_error: str | None = None
+        self.marketaux_last_error: str | None = None
+        self.marketaux_rate_limited = False
+        self.massive_last_error: str | None = None
+        self.massive_rate_limited = False
 
     def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any] | None:
         merged_headers = {"User-Agent": "devkim-research/1.0"}
@@ -314,11 +338,16 @@ class ApiClient:
                     source=(article.get("source") or {}).get("name") or DATA_MISSING,
                     published_at=article.get("publishedAt") or DATA_MISSING,
                     url=article.get("url") or DATA_MISSING,
+                    provider="NewsAPI",
                 )
             )
         return items
 
     def marketaux_news(self, query: str, target_date: date | None = None, page_size: int | None = None) -> list[NewsItem]:
+        if os.getenv("MARKETAUX_FORCE_DISABLED", "").lower() in {"1", "true", "yes", "on"}:
+            self.marketaux_rate_limited = True
+            self.marketaux_last_error = "사용자 지정으로 MarketAux 비활성화"
+            return []
         if not self.marketaux_key:
             return []
         marketaux = CONFIG["api"]["marketaux"]
@@ -334,7 +363,30 @@ class ApiClient:
             lookback_days = int(CONFIG["api"]["news_lookback_days"])
             params["published_after"] = (target_date - timedelta(days=lookback_days)).isoformat()
             params["published_before"] = f"{target_date.isoformat()}T23:59:59"
-        payload = self.get_json(f"{MARKETAUX_BASE_URL}?{urlencode(params)}")
+        url = f"{MARKETAUX_BASE_URL}?{urlencode(params)}"
+        request = Request(url, headers={"User-Agent": "devkim-research/1.0"})
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                self.marketaux_last_error = None
+                self.marketaux_rate_limited = False
+        except HTTPError as error:
+            self.marketaux_rate_limited = error.code == 429
+            try:
+                body = error.read().decode("utf-8")
+                payload = json.loads(body)
+                message = payload.get("error") or payload.get("message") or f"HTTP {error.code}"
+                self.marketaux_last_error = str(message)
+                lowered = self.marketaux_last_error.lower()
+                if "limit" in lowered or "quota" in lowered or "rate" in lowered:
+                    self.marketaux_rate_limited = True
+            except (OSError, json.JSONDecodeError):
+                self.marketaux_last_error = f"HTTP {error.code}"
+            return []
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            self.marketaux_last_error = "응답 파싱 실패"
+            self.marketaux_rate_limited = False
+            return []
         if not payload:
             return []
         items: list[NewsItem] = []
@@ -348,12 +400,68 @@ class ApiClient:
                     source=article.get("source") or DATA_MISSING,
                     published_at=article.get("published_at") or DATA_MISSING,
                     url=article.get("url") or DATA_MISSING,
+                    provider="MarketAux",
                 )
             )
         return items
 
-    def combined_news(self, query: str, target_date: date | None = None, page_size: int = 10, marketaux_query: str | None = None) -> list[NewsItem]:
+    def massive_reference_news(self, target_date: date | None = None, page_size: int | None = None, ticker: str | None = None) -> list[NewsItem]:
+        if not self.massive_key or self.massive_rate_limited:
+            return []
+        massive = CONFIG["api"]["massive"]
+        limit = page_size or int(massive["limit"])
+        params = {
+            "limit": str(limit),
+            "apiKey": self.massive_key,
+            "order": "desc",
+            "sort": "published_utc",
+        }
+        if target_date is not None:
+            lookback_days = int(CONFIG["api"]["news_lookback_days"])
+            params["published_utc.gte"] = f"{(target_date - timedelta(days=lookback_days)).isoformat()}T00:00:00Z"
+        if ticker:
+            params["ticker"] = ticker
+        url = f"{massive['base_url']}{massive['reference_news_path']}?{urlencode(params)}"
+        request = Request(url, headers={"User-Agent": "devkim-research/1.0"})
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                self.massive_last_error = None
+                self.massive_rate_limited = False
+        except HTTPError as error:
+            self.massive_rate_limited = error.code == 429
+            try:
+                body = error.read().decode("utf-8")
+                payload = json.loads(body)
+                self.massive_last_error = str(payload.get("message") or payload.get("error") or f"HTTP {error.code}")
+            except (OSError, json.JSONDecodeError):
+                self.massive_last_error = f"HTTP {error.code}"
+            return []
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            self.massive_last_error = "응답 파싱 실패"
+            return []
+        if not payload:
+            return []
+        items: list[NewsItem] = []
+        for article in payload.get("results", []):
+            description = article.get("description") or DATA_MISSING
+            items.append(
+                NewsItem(
+                    sector="",
+                    title=article.get("title") or DATA_MISSING,
+                    description=description,
+                    source=((article.get("publisher") or {}).get("name")) or DATA_MISSING,
+                    published_at=article.get("published_utc") or DATA_MISSING,
+                    url=article.get("article_url") or DATA_MISSING,
+                    provider="Massive",
+                )
+            )
+        return items
+
+    def combined_news(self, query: str, target_date: date | None = None, page_size: int = 10, marketaux_query: str | None = None, massive_ticker: str | None = None) -> list[NewsItem]:
         articles = self.marketaux_news(marketaux_query or query, target_date=target_date, page_size=page_size)
+        if self.marketaux_rate_limited:
+            articles.extend(self.massive_reference_news(target_date=target_date, page_size=max(page_size, 20), ticker=massive_ticker))
         articles.extend(self.news_everything(query, target_date=target_date, page_size=page_size))
         unique: list[NewsItem] = []
         seen: set[tuple[str, str]] = set()
@@ -373,6 +481,10 @@ class ApiClient:
         if not matches:
             return None
         return matches[0].get("1. symbol")
+
+    def yahoo_chart(self, symbol: str, interval: str = "1d", range_: str = "1mo") -> dict[str, Any] | None:
+        params = {"interval": interval, "range": range_}
+        return self.get_json(f"{YAHOO_CHART_BASE_URL}/{symbol}?{urlencode(params)}")
 
     def krx_query(self, path: str, **params: str) -> dict[str, Any] | None:
         if not self.krx_key:
@@ -559,6 +671,7 @@ class ReportDataBuilder:
 
     def _build_common_data(self, target_date: date) -> dict[str, dict[str, str]]:
         fred = self._build_fred_snapshot(target_date)
+        gold = self._build_gold_snapshot()
         krx_market = self._build_krx_market_data(target_date)
         kis_market = self._build_kis_market_data()
         return {
@@ -571,6 +684,11 @@ class ReportDataBuilder:
             "rates": {
                 "us10y": fred["us10y"]["text"],
                 "analysis": self._rate_analysis(fred["us10y"]),
+            },
+            "fx_commodities": {
+                "usdkrw": fred["usdkrw"]["text"],
+                "gold": gold["text"],
+                "analysis": self._fx_gold_analysis(fred["usdkrw"], gold),
             },
             "korea_market": {
                 "kospi": self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
@@ -611,6 +729,37 @@ class ReportDataBuilder:
                 "text": f"{_fmt_number(latest_val)} ({_compact_iso(latest[-1]['date'])})" if latest_val is not None and latest else DATA_MISSING,
             }
         return output
+
+    def _build_gold_snapshot(self) -> dict[str, str | float | None]:
+        payload = self.client.yahoo_chart("GC=F", interval="1d", range_="1mo") or {}
+        result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
+        timestamps = result.get("timestamp") or []
+        quote = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
+        closes = quote.get("close") or []
+        points: list[tuple[int, float]] = []
+        for timestamp, close in zip(timestamps, closes):
+            if close in (None, ""):
+                continue
+            points.append((timestamp, float(close)))
+        if not points:
+            return {
+                "value": None,
+                "prev_value": None,
+                "delta": None,
+                "date": DATA_MISSING,
+                "text": DATA_MISSING,
+            }
+        latest_ts, latest_value = points[-1]
+        prev_value = points[-2][1] if len(points) > 1 else None
+        delta = latest_value - prev_value if prev_value is not None else None
+        latest_date = datetime.utcfromtimestamp(latest_ts).strftime("%Y-%m-%d")
+        return {
+            "value": latest_value,
+            "prev_value": prev_value,
+            "delta": delta,
+            "date": latest_date,
+            "text": f"{_fmt_number(latest_value)} ({latest_date})",
+        }
 
     def _build_krx_market_data(self, target_date: date) -> dict[str, str]:
         if not self.client.krx_key:
@@ -810,10 +959,18 @@ class ReportDataBuilder:
         sector_data: dict[str, dict[str, str]] = {}
         for sector, query in self.news_queries.items():
             marketaux_query = MARKETAUX_SEARCH_QUERIES.get(sector, query)
-            articles = self.client.combined_news(query, target_date=target_date, page_size=10, marketaux_query=marketaux_query)
+            massive_ticker = MASSIVE_SECTOR_TICKERS.get(sector)
+            articles = self.client.combined_news(
+                query,
+                target_date=target_date,
+                page_size=10,
+                marketaux_query=marketaux_query,
+                massive_ticker=massive_ticker,
+            )
             top = self._select_relevant_article(sector, articles)
             localized_title = self._localize_headline(sector, top.title if top else DATA_MISSING)
             localized_description = self._localize_description(sector, localized_title, top.description if top else DATA_MISSING)
+            schedule = self._build_sector_schedule(sector, target_date)
             data = {
                 "headline": localized_title,
                 "headline_original": top.title if top else DATA_MISSING,
@@ -821,16 +978,27 @@ class ReportDataBuilder:
                 "source": top.source if top else DATA_MISSING,
                 "published_at": top.published_at if top else DATA_MISSING,
                 "url": top.url if top else DATA_MISSING,
+                "collection_path": self._collection_path_label(top),
                 "price_impact": self._headline_based_view(localized_title),
                 "short_term": self._headline_based_view(localized_title),
                 "medium_term": self._headline_based_view(localized_title),
                 "investment_judgment": self._investment_judgment_from_headline(localized_title),
                 "risk": self._risk_from_headline(localized_title),
+                "schedule": schedule["summary"],
+                "schedule_detail": schedule["detail"],
+                "schedule_view": schedule["view"],
             }
             if sector == "바이오/헬스케어":
                 data.update(self._build_bio_sector_data(target_date))
             sector_data[sector] = data
         return sector_data
+
+    def _collection_path_label(self, article: NewsItem | None) -> str:
+        if not article:
+            return DATA_MISSING
+        if article.provider == "NewsAPI":
+            return "기본 뉴스 소스"
+        return f"보조 소스 기반 ({article.provider})"
 
     def _localize_headline(self, sector: str, headline: str) -> str:
         if headline == DATA_MISSING:
@@ -885,13 +1053,37 @@ class ReportDataBuilder:
         keywords = NEWS_RELEVANCE_KEYWORDS.get(sector, [])
         filtered = [article for article in articles if not self._is_low_quality_article(article, sector)]
         filtered = [article for article in filtered if self._is_allowed_source(article, sector)]
+        if not filtered and self._is_fallback_news_mode():
+            filtered = [article for article in articles if not self._is_low_quality_article(article, sector)]
+        if not filtered and self._is_fallback_news_mode():
+            filtered = [article for article in articles if self._is_fallback_candidate(article, sector)]
         if not filtered:
             return None
         ranked = sorted(filtered, key=lambda article: self._relevance_score(article, keywords), reverse=True)
         top = ranked[0]
-        if self._relevance_score(top, keywords) <= 0:
+        min_score = 0 if self._is_fallback_news_mode() else 1
+        if self._relevance_score(top, keywords) < min_score:
             return None
         return top
+
+    def _is_fallback_news_mode(self) -> bool:
+        return self.client.marketaux_rate_limited or self.client.massive_rate_limited
+
+    def _is_fallback_candidate(self, article: NewsItem, sector: str) -> bool:
+        haystack = f"{article.title} {article.description} {article.source} {article.url}".lower()
+        if sector == "반도체":
+            return any(self._keyword_present(haystack, word) for word in ("semiconductor", "chip", "memory", "hbm", "foundry", "tsmc", "intel", "nvidia"))
+        if sector == "AI":
+            return any(self._keyword_present(haystack, word) for word in ("ai", "artificial intelligence", "openai", "nvidia", "microsoft", "amazon", "cloud"))
+        if sector == "로봇":
+            return any(self._keyword_present(haystack, word) for word in ("robot", "robotics", "humanoid", "automation", "tesla"))
+        if sector == "자동차/현대차":
+            return any(self._keyword_present(haystack, word) for word in ("hyundai", "kia", "automotive", "ev", "electric vehicle", "tesla", "motor"))
+        if sector == "바이오/헬스케어":
+            return any(self._keyword_present(haystack, word) for word in ("biotech", "healthcare", "clinical", "fda", "drug", "pharma", "trial", "therapeutic"))
+        if sector == "ETF: SCHD, QQQM, SPYG":
+            return any(self._keyword_present(haystack, word) for word in ("schd", "qqqm", "spyg", "etf", "dividend", "growth"))
+        return False
 
     def _relevance_score(self, article: NewsItem, keywords: list[str]) -> int:
         haystack = f"{article.title} {article.description} {article.source} {article.url}".lower()
@@ -981,6 +1173,60 @@ class ReportDataBuilder:
         if category == "디앤디파마텍":
             return "디앤디파마텍 직접 언급 해외 기사 미수집, 동종 바이오 모멘텀만 참고"
         return "해외 바이오 기사 확인"
+
+    def _build_sector_schedule(self, sector: str, target_date: date) -> dict[str, str]:
+        companies = SECTOR_DART_COMPANIES.get(sector, [])
+        if not companies:
+            return {
+                "summary": DATA_MISSING,
+                "detail": f"{DATA_MISSING} (섹터 일정 매핑 미구성)",
+                "view": "섹터 일정 해석 보류",
+            }
+        lookback_days = int(self.api_config["dart_disclosure_lookback_days"])
+        matched: list[tuple[str, DisclosureItem]] = []
+        for company in companies:
+            items = self.client.dart_disclosures(company, target_date, lookback_days=lookback_days)
+            if not items:
+                continue
+            for item in items[:3]:
+                if self._is_schedule_disclosure(item.report_name):
+                    matched.append((company, item))
+            if len(matched) >= 3:
+                break
+        if not matched:
+            return {
+                "summary": DATA_MISSING,
+                "detail": f"{DATA_MISSING} (최근 {lookback_days}일 내 실적발표/IR/정기공시 일정성 공시 미수집)",
+                "view": "섹터 대표 종목의 일정성 공시가 부족해 이벤트 드리븐 해석 보류",
+            }
+        matched.sort(key=lambda pair: pair[1].filed_at, reverse=True)
+        top = matched[:3]
+        summary = " | ".join(f"{company}: {item.report_name} ({item.filed_at})" for company, item in top)
+        detail = " / ".join(f"{company} -> {item.report_name} ({item.filed_at})" for company, item in top)
+        view = self._sector_schedule_view(top)
+        return {
+            "summary": summary,
+            "detail": detail,
+            "view": view,
+        }
+
+    def _is_schedule_disclosure(self, report_name: str) -> bool:
+        keywords = (
+            "기업설명회", "ir", "실적", "잠정실적", "분기보고서", "반기보고서", "사업보고서",
+            "주주총회", "소집공고", "소집결의", "결산", "매출액또는손익구조", "영업(잠정)",
+        )
+        lowered = report_name.lower()
+        return any(keyword in report_name or keyword in lowered for keyword in keywords)
+
+    def _sector_schedule_view(self, items: list[tuple[str, DisclosureItem]]) -> str:
+        names = [item.report_name for _, item in items]
+        if any("기업설명회" in name or "ir" in name.lower() for name in names):
+            return "IR/실적 커뮤니케이션 이벤트가 있어 단기 변동성 확대 가능성 점검 필요"
+        if any("분기보고서" in name or "반기보고서" in name or "사업보고서" in name for name in names):
+            return "정기공시 구간으로 숫자 확인 전 선반영 추격보다 공시 내용 확인이 우선"
+        if any("잠정" in name or "실적" in name or "매출액" in name for name in names):
+            return "실적 이벤트 성격이 강해 뉴스보다 숫자 확인 이후 대응이 유리"
+        return "섹터 일정은 확인되지만 구체 수치 전까지 이벤트 해석은 보수적으로 접근"
 
     def _build_disclosures(self, target_date: date) -> dict[str, Any]:
         items_by_company: dict[str, list[DisclosureItem]] = {}
@@ -1135,7 +1381,14 @@ class ReportDataBuilder:
     ) -> dict[str, str]:
         fred_ok = "연결됨" if common["fred"]["us10y"]["text"] != DATA_MISSING else "미연결"
         news_ok = "연결됨" if any(data.get("headline") != DATA_MISSING for data in sectors.values()) else "미연결"
-        marketaux_ok = "연결됨" if self.client.marketaux_key else "미연결"
+        if self.client.marketaux_rate_limited:
+            marketaux_ok = "한도 초과(우회 중)"
+        else:
+            marketaux_ok = "연결됨" if self.client.marketaux_key else "미연결"
+        if self.client.massive_rate_limited:
+            massive_ok = "한도 초과"
+        else:
+            massive_ok = "연결됨" if self.client.massive_key else "미연결"
         dart_ok = "연결됨" if disclosures.get("recent") != DATA_MISSING else "미연결"
         alpha_ok = "부분 연결" if hyundai.get("current_close") != DATA_MISSING else "미연결"
         krx_ok = "연결됨" if common["korea_market"]["kospi"] != DATA_MISSING else ("권한 오류" if self.client.krx_key and self.client.krx_last_error else "미연결")
@@ -1152,6 +1405,7 @@ class ReportDataBuilder:
             "fred_status": fred_ok,
             "news_status": news_ok,
             "marketaux_status": marketaux_ok,
+            "massive_status": massive_ok,
             "alpha_status": alpha_ok,
             "dart_status": dart_ok,
             "krx_status": krx_ok,
@@ -1238,6 +1492,24 @@ class ReportDataBuilder:
             return ANALYSIS_PENDING
         return "전일 대비 상승이면 성장주 할인율 부담, 하락이면 반등 여지 점검."
 
+    def _fx_gold_analysis(self, usdkrw: dict[str, Any], gold: dict[str, Any]) -> str:
+        usdkrw_delta = usdkrw.get("delta")
+        gold_delta = gold.get("delta")
+        notes: list[str] = []
+        if usdkrw_delta is not None:
+            if usdkrw_delta > 0:
+                notes.append("원/달러 환율 상승은 외국인 수급과 수입물가 부담 측면에서 한국 증시에 부담")
+            elif usdkrw_delta < 0:
+                notes.append("원/달러 환율 하락은 외국인 위험선호 회복에 우호적")
+        if gold_delta is not None:
+            if gold_delta > 0:
+                notes.append("금 가격 상승은 안전자산 선호 강화 신호로 해석 가능")
+            elif gold_delta < 0:
+                notes.append("금 가격 하락은 위험자산 선호 회복 여부를 함께 점검할 구간")
+        if not notes:
+            return ANALYSIS_PENDING
+        return " | ".join(notes)
+
     def _headline_based_view(self, headline: str) -> str:
         if headline == DATA_MISSING:
             return "관련 뉴스 미수집으로 영향 분석 보류"
@@ -1279,10 +1551,16 @@ class ReportDataBuilder:
         fed = fred.get("fed_funds", {})
         if fed.get("text") != DATA_MISSING:
             issues.append(f"연방기금금리: {fed.get('text', DATA_MISSING)}")
+        usdkrw = fred.get("usdkrw", {})
+        if usdkrw.get("text") != DATA_MISSING:
+            issues.append(f"원/달러 환율: {usdkrw.get('text', DATA_MISSING)}")
+        gold = common.get("fx_commodities", {}).get("gold", DATA_MISSING)
+        if gold != DATA_MISSING:
+            issues.append(f"금 시세: {gold}")
         if disclosures.get("recent") != DATA_MISSING:
             issues.append(f"최근 공시: {disclosures['recent']}")
         if issues:
-            return " | ".join(issues[:3])
+            return " | ".join(issues[:5])
         return "세계 주요 이슈는 데이터 미수집 (FRED/DART 또는 해외 매크로 뉴스 데이터 부족)"
 
     def _industry_major_issues(self, sectors: dict[str, dict[str, str]]) -> str:
