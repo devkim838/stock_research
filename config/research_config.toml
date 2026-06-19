@@ -1,0 +1,144 @@
+timezone = "Asia/Seoul"
+language = "ko"
+date_format = "%Y-%m-%d"
+timestamp_format = "%Y-%m-%d %H:%M:%S %Z"
+log_file = "logs/generation.log"
+research_root = "research"
+default_author = "Codex Research Automation"
+
+[api]
+dotenv_path = ".env"
+news_lookback_days = 7
+dart_disclosure_lookback_days = 30
+
+[api.kis]
+base_url = "https://openapi.koreainvestment.com:9443"
+token_url = "/oauth2/tokenP"
+enabled_env = "KIS_APP_KEY"
+app_secret_env = "KIS_APP_SECRET"
+current_price_path = ""
+daily_price_path = ""
+index_price_path = ""
+investor_flow_path = ""
+
+[market_data.fred]
+us10y = "DGS10"
+cpi = "CPIAUCSL"
+ppi = "PPIACO"
+unemployment = "UNRATE"
+fed_funds = "FEDFUNDS"
+
+[market_data.news_queries]
+"반도체" = "(semiconductor OR HBM OR memory chip OR foundry OR SK hynix OR Samsung Electronics)"
+"AI" = "(artificial intelligence OR generative AI OR LLM OR OpenAI OR Nvidia OR Microsoft)"
+"로봇" = "(robotics OR humanoid robot OR factory automation OR industrial robot)"
+"자동차/현대차" = "(\"Hyundai Motor\" OR Hyundai OR Kia OR EV OR automotive software)"
+"바이오/헬스케어" = "(biotech OR healthcare OR clinical trial OR FDA OR pharma licensing OR drug discovery)"
+"ETF: SCHD, QQQM, SPYG" = "SCHD OR QQQM OR SPYG"
+
+[[tracked_companies]]
+name = "현대차"
+dart_name = "현대자동차"
+alpha_symbol = "HYMLF"
+alpha_search_keywords = ["Hyundai Motor", "005380"]
+
+[[tracked_companies]]
+name = "삼성전자"
+dart_name = "삼성전자"
+
+[[tracked_companies]]
+name = "디앤디파마텍"
+dart_name = "디앤디파마텍"
+
+[naming]
+daily_pattern = "{date}-{session}.md"
+weekly_pattern = "{year}-W{week:02d}.md"
+monthly_pattern = "{year}-{month:02d}.md"
+
+[wiki]
+base_url = "/wiki"
+link_style = "relative"
+
+[sessions.morning]
+title = "오전 리서치"
+folder = "morning"
+template = "templates/morning.md"
+summary_hint = "장 시작 전 핵심 체크포인트와 오늘의 가설을 정리합니다."
+
+[sessions.afternoon]
+title = "오후 리서치"
+folder = "afternoon"
+template = "templates/afternoon.md"
+summary_hint = "장중 변화와 오전 가설의 수정 여부를 정리합니다."
+
+[sessions.closing]
+title = "마감 리서치"
+folder = "closing"
+template = "templates/closing.md"
+summary_hint = "종가 기준 해석과 다음 거래일 준비 사항을 정리합니다."
+
+[periods.weekly]
+title = "주간 리서치"
+folder = "weekly"
+template = "templates/weekly.md"
+
+[periods.monthly]
+title = "월간 리서치"
+folder = "monthly"
+template = "templates/monthly.md"
+
+[[assets]]
+slug = "hyundai"
+name = "현대차"
+category = "company"
+path = "companies/hyundai/index.md"
+tags = ["자동차", "전기차", "모빌리티", "한국"]
+
+[[assets]]
+slug = "schd"
+name = "SCHD"
+category = "etf"
+path = "etf/schd/index.md"
+tags = ["ETF", "배당", "미국"]
+
+[[assets]]
+slug = "qqqm"
+name = "QQQM"
+category = "etf"
+path = "etf/qqqm/index.md"
+tags = ["ETF", "나스닥", "성장"]
+
+[[assets]]
+slug = "spyg"
+name = "SPYG"
+category = "etf"
+path = "etf/spyg/index.md"
+tags = ["ETF", "S&P500", "성장"]
+
+[[assets]]
+slug = "robot"
+name = "로봇"
+category = "industry"
+path = "industries/robot/index.md"
+tags = ["산업", "자동화", "로봇"]
+
+[[assets]]
+slug = "ai"
+name = "AI"
+category = "industry"
+path = "industries/ai/index.md"
+tags = ["산업", "인공지능", "소프트웨어"]
+
+[[assets]]
+slug = "semiconductor"
+name = "반도체"
+category = "industry"
+path = "industries/semiconductor/index.md"
+tags = ["산업", "반도체", "인프라"]
+
+[[assets]]
+slug = "bio-healthcare"
+name = "바이오/헬스케어"
+category = "industry"
+path = "industries/bio-healthcare/index.md"
+tags = ["산업", "바이오", "헬스케어", "제약"]

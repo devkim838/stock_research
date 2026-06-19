@@ -1,0 +1,16 @@
+timezone = "Asia/Seoul"
+
+[slots.morning]
+hour = 8
+minute = 0
+session = "morning"
+
+[slots.afternoon]
+hour = 13
+minute = 0
+session = "afternoon"
+
+[slots.closing]
+hour = 17
+minute = 0
+session = "closing"
