@@ -129,33 +129,53 @@ def build_common_sections(report_data: dict | None = None) -> str:
 
 
 def build_hyundai_section(report_data: dict | None = None) -> str:
-    hyundai = (report_data or {}).get("hyundai", {})
-    lines = [
-        "<!-- TODO: API 연동 시 현대차 가격, 거래량, 투자주체 수급, 이동평균을 자동 채움. -->",
-        "## 현대차 전용 분석",
+    favorites = (report_data or {}).get("favorites", {})
+    hyundai = favorites.get("hyundai", (report_data or {}).get("hyundai", {}))
+    dnd = favorites.get("dnd", {})
+    sections = [
+        "<!-- TODO: API 연동 시 현대차·디앤디파마텍 가격, 거래량, 투자주체 수급, 이동평균을 자동 채움. -->",
+        "## 즐겨 찾는 개별주",
         "",
-        f"- 현재가/종가: {hyundai.get('current_close', DATA_MISSING)}",
-        f"- 전일 종가: {with_missing_reason(hyundai.get('previous_close', DATA_MISSING), 'Alpha Vantage 일별 종가 이력 부족')}",
-        f"- 장중 고가/저가: {hyundai.get('intraday_high_low', DATA_MISSING)}",
-        f"- 거래량: {hyundai.get('volume', DATA_MISSING)}",
-        f"- 52주 고가: {with_missing_reason(hyundai.get('week52_high', DATA_MISSING), 'Alpha Vantage 52주 범위 이력 부족')}",
-        f"- 52주 저가: {with_missing_reason(hyundai.get('week52_low', DATA_MISSING), 'Alpha Vantage 52주 범위 이력 부족')}",
-        f"- 외국인 순매수/순매도: {with_missing_reason(hyundai.get('foreign_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
-        f"- 기관 순매수/순매도: {with_missing_reason(hyundai.get('institutional_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
-        f"- 개인 순매수/순매도: {with_missing_reason(hyundai.get('retail_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
-        f"- 공매도: {with_missing_reason(hyundai.get('short_selling', DATA_MISSING), '공매도 잔고/거래비중 API 미연동')}",
-        f"- 반대매매: {with_missing_reason(hyundai.get('forced_liquidation', DATA_MISSING), '반대매매 집계 데이터 소스 미연동')}",
-        f"- 5일 이동평균: {with_missing_reason(hyundai.get('ma5', DATA_MISSING), '시세 히스토리 부족')}",
-        f"- 20일 이동평균: {with_missing_reason(hyundai.get('ma20', DATA_MISSING), '시세 히스토리 부족')}",
-        f"- 60일 이동평균: {with_missing_reason(hyundai.get('ma60', DATA_MISSING), '시세 히스토리 부족')}",
-        f"- 지지선: {with_missing_reason(hyundai.get('support', DATA_MISSING), '충분한 가격 이력 부족')}",
-        f"- 저항선: {with_missing_reason(hyundai.get('resistance', DATA_MISSING), '충분한 가격 이력 부족')}",
-        f"- 오늘 해석: {hyundai.get('today_analysis', ANALYSIS_PENDING)}",
-        f"- 내일 시나리오: {hyundai.get('tomorrow_scenario', ANALYSIS_PENDING)}",
-        f"- 추가매수 기준: {hyundai.get('add_rule', ANALYSIS_PENDING)}",
-        f"- 매도/탈출 기준: {hyundai.get('exit_rule', ANALYSIS_PENDING)}",
+        build_favorite_stock_block("현대차", hyundai),
+        "",
+        build_favorite_stock_block("디앤디파마텍", dnd),
     ]
-    return "\n".join(lines)
+    return "\n".join(sections)
+
+
+def build_favorite_stock_block(name: str, data: dict | None = None) -> str:
+    data = data or {}
+    return "\n".join(
+        [
+            f"### {name}",
+            "",
+            f"- 현재가/종가: {data.get('current_close', DATA_MISSING)}",
+            f"- 전일 종가: {with_missing_reason(data.get('previous_close', DATA_MISSING), '일별 종가 이력 부족')}",
+            f"- 장중 고가/저가: {data.get('intraday_high_low', DATA_MISSING)}",
+            f"- 거래량: {data.get('volume', DATA_MISSING)}",
+            f"- 52주 고가: {with_missing_reason(data.get('week52_high', DATA_MISSING), '52주 범위 이력 부족')}",
+            f"- 52주 저가: {with_missing_reason(data.get('week52_low', DATA_MISSING), '52주 범위 이력 부족')}",
+            f"- 외국인 순매수/순매도: {with_missing_reason(data.get('foreign_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
+            f"- 기관 순매수/순매도: {with_missing_reason(data.get('institutional_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
+            f"- 개인 순매수/순매도: {with_missing_reason(data.get('retail_flow', DATA_MISSING), '국내 투자주체 수급 API 미연동')}",
+            f"- 공매도: {with_missing_reason(data.get('short_selling', DATA_MISSING), '공매도 잔고/거래비중 API 미연동')}",
+            f"- 반대매매: {with_missing_reason(data.get('forced_liquidation', DATA_MISSING), '반대매매 집계 데이터 소스 미연동')}",
+            f"- 5일 이동평균: {with_missing_reason(data.get('ma5', DATA_MISSING), '시세 히스토리 부족')}",
+            f"- 20일 이동평균: {with_missing_reason(data.get('ma20', DATA_MISSING), '시세 히스토리 부족')}",
+            f"- 60일 이동평균: {with_missing_reason(data.get('ma60', DATA_MISSING), '시세 히스토리 부족')}",
+            f"- 지지선: {with_missing_reason(data.get('support', DATA_MISSING), '충분한 가격 이력 부족')}",
+            f"- 저항선: {with_missing_reason(data.get('resistance', DATA_MISSING), '충분한 가격 이력 부족')}",
+            f"- 차트 구조: {data.get('chart_structure', ANALYSIS_PENDING)}",
+            f"- 개미 털기 판단: {data.get('shakeout_view', ANALYSIS_PENDING)}",
+            f"- 하락하는 이유: {data.get('down_reason', ANALYSIS_PENDING)}",
+            f"- 상승하는 이유: {data.get('up_reason', ANALYSIS_PENDING)}",
+            f"- 오늘 해석: {data.get('today_analysis', ANALYSIS_PENDING)}",
+            f"- 내일 시나리오: {data.get('tomorrow_scenario', ANALYSIS_PENDING)}",
+            f"- 예측: {data.get('forecast', ANALYSIS_PENDING)}",
+            f"- 추가매수 기준: {data.get('add_rule', ANALYSIS_PENDING)}",
+            f"- 매도/탈출 기준: {data.get('exit_rule', ANALYSIS_PENDING)}",
+        ]
+    )
 
 
 def build_sector_news_sections(report_data: dict | None = None) -> str:
@@ -330,6 +350,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 1: {session_data.get('stock_1_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 1: {session_data.get('stock_1_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 1: {session_data.get('stock_1_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 1: {session_data.get('stock_1_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 1: {session_data.get('stock_1_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 1: {session_data.get('stock_1_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 1: {session_data.get('stock_1_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 1: {session_data.get('stock_1_forecast', ANALYSIS_PENDING)}",
                 "",
                 f"- 자동 선별 2: {stock_label(session_data.get('stock_2_name', DATA_MISSING), session_data.get('stock_2_sector', DATA_MISSING))}",
                 f"- 선별 근거 2: {session_data.get('stock_2_reason', ANALYSIS_PENDING)}",
@@ -337,6 +362,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 2: {session_data.get('stock_2_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 2: {session_data.get('stock_2_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 2: {session_data.get('stock_2_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 2: {session_data.get('stock_2_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 2: {session_data.get('stock_2_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 2: {session_data.get('stock_2_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 2: {session_data.get('stock_2_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 2: {session_data.get('stock_2_forecast', ANALYSIS_PENDING)}",
                 "",
                 f"- 자동 선별 3: {stock_label(session_data.get('stock_3_name', DATA_MISSING), session_data.get('stock_3_sector', DATA_MISSING))}",
                 f"- 선별 근거 3: {session_data.get('stock_3_reason', ANALYSIS_PENDING)}",
@@ -344,6 +374,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 3: {session_data.get('stock_3_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 3: {session_data.get('stock_3_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 3: {session_data.get('stock_3_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 3: {session_data.get('stock_3_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 3: {session_data.get('stock_3_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 3: {session_data.get('stock_3_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 3: {session_data.get('stock_3_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 3: {session_data.get('stock_3_forecast', ANALYSIS_PENDING)}",
                 "",
                 "## 공통 리스크 관리",
                 "",
@@ -392,6 +427,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 1: {session_data.get('stock_1_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 1: {session_data.get('stock_1_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 1: {session_data.get('stock_1_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 1: {session_data.get('stock_1_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 1: {session_data.get('stock_1_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 1: {session_data.get('stock_1_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 1: {session_data.get('stock_1_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 1: {session_data.get('stock_1_forecast', ANALYSIS_PENDING)}",
                 "",
                 f"- 자동 선별 2: {stock_label(session_data.get('stock_2_name', DATA_MISSING), session_data.get('stock_2_sector', DATA_MISSING))}",
                 f"- 선별 근거 2: {session_data.get('stock_2_reason', ANALYSIS_PENDING)}",
@@ -399,6 +439,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 2: {session_data.get('stock_2_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 2: {session_data.get('stock_2_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 2: {session_data.get('stock_2_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 2: {session_data.get('stock_2_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 2: {session_data.get('stock_2_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 2: {session_data.get('stock_2_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 2: {session_data.get('stock_2_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 2: {session_data.get('stock_2_forecast', ANALYSIS_PENDING)}",
                 "",
                 f"- 자동 선별 3: {stock_label(session_data.get('stock_3_name', DATA_MISSING), session_data.get('stock_3_sector', DATA_MISSING))}",
                 f"- 선별 근거 3: {session_data.get('stock_3_reason', ANALYSIS_PENDING)}",
@@ -406,6 +451,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 추가매수 기준 3: {session_data.get('stock_3_add', ANALYSIS_PENDING)}",
                 f"- 손절/탈출 기준 3: {session_data.get('stock_3_exit', ANALYSIS_PENDING)}",
                 f"- 시나리오 무효화 3: {session_data.get('stock_3_invalid', ANALYSIS_PENDING)}",
+                f"- 차트 구조 3: {session_data.get('stock_3_chart', ANALYSIS_PENDING)}",
+                f"- 개미 털기 판단 3: {session_data.get('stock_3_shakeout', ANALYSIS_PENDING)}",
+                f"- 하락 이유 3: {session_data.get('stock_3_down_reason', ANALYSIS_PENDING)}",
+                f"- 상승 이유 3: {session_data.get('stock_3_up_reason', ANALYSIS_PENDING)}",
+                f"- 예측 3: {session_data.get('stock_3_forecast', ANALYSIS_PENDING)}",
                 "",
                 "## 공통 리스크 관리",
                 "",

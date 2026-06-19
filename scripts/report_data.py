@@ -658,11 +658,13 @@ class ReportDataBuilder:
         sectors = self._build_sector_data(target_date)
         disclosures = self._build_disclosures(target_date)
         hyundai = self._build_hyundai_data(target_date)
+        favorites = self._build_favorite_stocks(hyundai, sectors, disclosures)
         session_data = self._build_session_data(session, common, hyundai, sectors, disclosures)
         return {
             "session": session_data,
             "common": common,
             "hyundai": hyundai,
+            "favorites": favorites,
             "sectors": sectors,
             "disclosures": disclosures,
             "coverage": self._build_coverage(common, hyundai, sectors, disclosures),
@@ -937,6 +939,11 @@ class ReportDataBuilder:
             "tomorrow_scenario": self._hyundai_scenario(current_price, ma20),
             "add_rule": self._hyundai_add_rule(current_price, ma20),
             "exit_rule": self._hyundai_exit_rule(current_price, ma20),
+            "chart_structure": self._favorite_chart_structure(current_price, ma20, ma60, "현대차"),
+            "shakeout_view": self._shakeout_view(current_price, ma20, ma60, "현대차"),
+            "down_reason": self._favorite_down_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
+            "up_reason": self._favorite_up_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
+            "forecast": self._favorite_forecast(current_price, ma20, ma60, "현대차"),
         }
 
     def _build_krx_hyundai_data(self, target_date: date) -> dict[str, str]:
@@ -946,6 +953,50 @@ class ReportDataBuilder:
             "volume": DATA_MISSING,
             "intraday_high_low": DATA_MISSING,
             "short_selling": DATA_MISSING,
+        }
+
+    def _build_favorite_stocks(
+        self,
+        hyundai: dict[str, str],
+        sectors: dict[str, dict[str, str]],
+        disclosures: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        dnd = self._build_dnd_favorite_data(sectors, disclosures)
+        return {
+            "hyundai": hyundai,
+            "dnd": dnd,
+        }
+
+    def _build_dnd_favorite_data(self, sectors: dict[str, dict[str, str]], disclosures: dict[str, Any]) -> dict[str, str]:
+        bio = sectors.get("바이오/헬스케어", {})
+        disclosure = self._latest_company_disclosure("디앤디파마텍", disclosures)
+        return {
+            "symbol": DATA_MISSING,
+            "current_close": DATA_MISSING,
+            "previous_close": DATA_MISSING,
+            "volume": DATA_MISSING,
+            "week52_high": DATA_MISSING,
+            "week52_low": DATA_MISSING,
+            "intraday_high_low": DATA_MISSING,
+            "foreign_flow": DATA_MISSING,
+            "institutional_flow": DATA_MISSING,
+            "retail_flow": DATA_MISSING,
+            "short_selling": DATA_MISSING,
+            "forced_liquidation": DATA_MISSING,
+            "ma5": DATA_MISSING,
+            "ma20": DATA_MISSING,
+            "ma60": DATA_MISSING,
+            "support": DATA_MISSING,
+            "resistance": DATA_MISSING,
+            "today_analysis": self._dnd_today_analysis(bio, disclosure),
+            "tomorrow_scenario": self._dnd_tomorrow_scenario(bio, disclosure),
+            "add_rule": self._dnd_add_rule(disclosure),
+            "exit_rule": self._dnd_exit_rule(disclosure),
+            "chart_structure": "차트 데이터 미수집 (국내 개별 종목 시세 API 미연동). 현재는 바이오 섹터 뉴스와 공시가 가격 방향의 선행 단서다.",
+            "shakeout_view": "개미 털기 여부는 데이터 미수집 (분봉/체결강도/호가 데이터 미연동). 단기 급등 이후 거래량 없는 눌림이면 털기보다 관심 이탈 가능성 쪽을 우선 점검.",
+            "down_reason": self._favorite_down_reason(None, None, None, disclosure, "디앤디파마텍"),
+            "up_reason": self._favorite_up_reason(None, None, None, disclosure, "디앤디파마텍"),
+            "forecast": self._favorite_forecast(None, None, None, "디앤디파마텍"),
         }
 
     def _resolve_alpha_symbol(self, company: dict[str, Any]) -> str | None:
@@ -1747,6 +1798,11 @@ class ReportDataBuilder:
             payload[f"{prefix}_add"] = slot["add"] if slot else "자동 선별 후보 없음"
             payload[f"{prefix}_exit"] = slot["exit"] if slot else "자동 선별 후보 없음"
             payload[f"{prefix}_invalid"] = slot["invalid"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_chart"] = slot["chart"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_shakeout"] = slot["shakeout"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_down_reason"] = slot["down_reason"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_up_reason"] = slot["up_reason"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_forecast"] = slot["forecast"] if slot else "자동 선별 후보 없음"
         return payload
 
     def _auto_select_stock_candidates(
@@ -1798,6 +1854,11 @@ class ReportDataBuilder:
             "add": self._generic_stock_add_rule(name, disclosure),
             "exit": f"{name} 손절/탈출 기준은 데이터 미수집 (개별 종목 가격·거래량 API 미연동)",
             "invalid": self._generic_stock_invalid_rule(sector, headline, disclosure),
+            "chart": self._generic_stock_chart_view(name, sector, headline, disclosure),
+            "shakeout": self._generic_stock_shakeout_view(name, headline, disclosure),
+            "down_reason": self._generic_stock_down_reason(name, sector, headline, disclosure),
+            "up_reason": self._generic_stock_up_reason(name, sector, headline, disclosure),
+            "forecast": self._generic_stock_forecast(name, sector, headline, disclosure),
         }
 
     def _latest_company_disclosure(self, company_name: str, disclosures: dict[str, Any]) -> str:
@@ -1823,6 +1884,43 @@ class ReportDataBuilder:
         if headline != DATA_MISSING:
             return f"{sector} 뉴스 방향이 바뀌거나 후속 기사로 반박되면 시나리오 무효"
         return "시나리오 무효화 조건은 데이터 미수집 (개별 근거 부족)"
+
+    def _generic_stock_chart_view(self, name: str, sector: str, headline: str, disclosure: str) -> str:
+        if headline != DATA_MISSING and disclosure != DATA_MISSING:
+            return f"{name} 차트 데이터는 미수집이지만, 현재는 {sector} 뉴스와 공시가 동시에 있는 이벤트 구간이라 캔들 모양보다 거래대금 확대 여부 확인이 우선."
+        if headline != DATA_MISSING:
+            return f"{name} 차트 데이터는 미수집. 현재는 {sector} 뉴스 모멘텀이 선행하고 있어 눌림 후 재확산인지 확인이 필요."
+        if disclosure != DATA_MISSING:
+            return f"{name} 차트 데이터는 미수집. 최근 공시가 가격 변동의 직접 계기일 수 있어 공시 해석 후 대응이 우선."
+        return f"{name} 차트 구조는 데이터 미수집 (개별 가격·거래량 API 미연동)"
+
+    def _generic_stock_shakeout_view(self, name: str, headline: str, disclosure: str) -> str:
+        if headline != DATA_MISSING or disclosure != DATA_MISSING:
+            return f"{name} 개미 털기 여부는 데이터 미수집. 분봉·호가 없이 단정하지 말고, 장중 급락 후 거래대금이 유지되는지만 확인 필요."
+        return f"{name} 개미 털기 판단은 데이터 미수집 (분봉/체결강도 미연동)"
+
+    def _generic_stock_down_reason(self, name: str, sector: str, headline: str, disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return f"{name} 하락 시 해석 우선순위는 공시 실망, 공시 오해, 차익실현 가능성 순이다."
+        if headline != DATA_MISSING:
+            return f"{name} 하락 시 해석 우선순위는 {sector} 뉴스 약화, 후속 기사 부재, 테마 과열 해소 가능성 순이다."
+        return f"{name} 하락 이유 분석은 데이터 미수집 (개별 시세와 뉴스 근거 부족)"
+
+    def _generic_stock_up_reason(self, name: str, sector: str, headline: str, disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return f"{name} 상승 시 해석 우선순위는 공시 재평가, IR 기대, 섹터 동반 강세 여부다."
+        if headline != DATA_MISSING:
+            return f"{name} 상승 시 해석 우선순위는 {sector} 뉴스 확산, 관련주 순환매, 거래대금 집중 여부다."
+        return f"{name} 상승 이유 분석은 데이터 미수집 (개별 시세와 뉴스 근거 부족)"
+
+    def _generic_stock_forecast(self, name: str, sector: str, headline: str, disclosure: str) -> str:
+        if headline != DATA_MISSING and disclosure != DATA_MISSING:
+            return f"{name} 예측: 뉴스와 공시가 같은 방향이면 하루 더 연장 시도 가능, 엇갈리면 변동성만 남고 추세는 약해질 수 있다."
+        if headline != DATA_MISSING:
+            return f"{name} 예측: {sector} 뉴스 후속 보도가 이어지면 단기 재시도 가능, 후속 부재면 하루 이틀 내 힘이 빠질 수 있다."
+        if disclosure != DATA_MISSING:
+            return f"{name} 예측: 공시 해석이 우호적이면 재료 소화 후 재반등 가능, 숫자 확인 전까지는 장중 흔들림이 클 수 있다."
+        return f"{name} 예측은 데이터 미수집 (차트·수급·뉴스 근거 부족)"
 
     def _combine_values(self, high: float | None, low: float | None) -> str:
         if high is None or low is None:
@@ -1877,6 +1975,47 @@ class ReportDataBuilder:
                 return value
         return DATA_MISSING
 
+    def _favorite_chart_structure(self, current: float | None, ma20: float | None, ma60: float | None, name: str) -> str:
+        if current is None or ma20 is None or ma60 is None:
+            return f"{name} 차트 구조는 데이터 미수집 (종가 또는 이동평균 이력 부족)"
+        if current > ma20 > ma60:
+            return f"{name}는 단기·중기 이동평균 위에 있어 우상향 구조다. 눌림이 와도 추세 훼손 전까지는 상승 추세 해석이 우선."
+        if current < ma20 < ma60:
+            return f"{name}는 20일선과 60일선 아래라 약세 구조다. 반등이 나와도 추세 반전보다 기술적 되돌림 가능성을 먼저 봐야 한다."
+        return f"{name}는 이동평균이 엇갈려 방향성이 약하다. 추세 추종보다 지지/저항 확인이 우선이다."
+
+    def _shakeout_view(self, current: float | None, ma20: float | None, ma60: float | None, name: str) -> str:
+        if current is None or ma20 is None:
+            return f"{name} 개미 털기 판단은 데이터 미수집 (분봉·거래량·이동평균 부족)"
+        if current > ma20:
+            return f"{name}는 최소한 20일선 위에 있어 흔들림이 나와도 즉시 개미 털기로 단정하기보다 상승 추세 내 조정 가능성을 먼저 점검."
+        return f"{name}는 20일선 아래라 단순 개미 털기보다 추세 약화 가능성을 더 경계해야 한다."
+
+    def _favorite_down_reason(self, current: float | None, ma20: float | None, ma60: float | None, disclosure: str, name: str) -> str:
+        if disclosure != DATA_MISSING:
+            return f"{name} 하락 시 우선 해석은 공시 재료 소멸, 공시 내용 실망, 이벤트 선반영 후 차익실현 여부다."
+        if current is None or ma20 is None:
+            return f"{name} 하락 이유 분석은 데이터 미수집 (가격·이동평균 또는 공시 근거 부족)"
+        if current < ma20:
+            return f"{name} 하락은 단기 추세 이탈에 따른 매물 압박으로 해석 가능하다. 20일선 회복 실패 시 추가 약세를 경계."
+        return f"{name} 하락은 추세 훼손보다 단기 과열 해소 가능성을 먼저 점검할 구간이다."
+
+    def _favorite_up_reason(self, current: float | None, ma20: float | None, ma60: float | None, disclosure: str, name: str) -> str:
+        if disclosure != DATA_MISSING:
+            return f"{name} 상승 시 우선 해석은 IR/공시 재평가, 숫자 기대, 이벤트 드리븐 수급 유입 여부다."
+        if current is None or ma20 is None:
+            return f"{name} 상승 이유 분석은 데이터 미수집 (가격·이동평균 또는 공시 근거 부족)"
+        if current > ma20:
+            return f"{name} 상승은 20일선 상방 유지에 따른 추세 추종 수급 유입으로 해석 가능하다."
+        return f"{name} 상승은 추세 반전 시도일 수 있으나 20일선 회복 전까지는 기술적 반등으로 보는 편이 안전하다."
+
+    def _favorite_forecast(self, current: float | None, ma20: float | None, ma60: float | None, name: str) -> str:
+        if current is None or ma20 is None:
+            return f"{name} 예측은 데이터 미수집 (종가·이동평균 부족). 숫자 없이 방향성 단정 금지."
+        if current > ma20:
+            return f"{name} 예측: 20일선 위 안착이 이어지면 재상승 시도 가능. 다만 거래량 확인 없이 추세 연장으로 단정하지 말 것."
+        return f"{name} 예측: 20일선 회복 전까지는 반등보다 저항 확인 구간이다. 반등 실패 시 재차 눌림 가능성을 열어둬야 한다."
+
     def _hyundai_analysis(self, current: float | None, ma20: float | None, ma60: float | None) -> str:
         if current is None or ma20 is None or ma60 is None:
             return "현대차 이동평균 또는 종가 이력이 부족해 추세 분석 보류"
@@ -1906,3 +2045,27 @@ class ReportDataBuilder:
         if current < ma20:
             return f"20일선({_fmt_number(ma20)}) 이탈 지속 시 비중 축소."
         return "단기 급등 후 거래량 둔화 시 일부 이익실현."
+
+    def _dnd_today_analysis(self, bio: dict[str, str], disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return f"디앤디파마텍은 최근 공시({disclosure})가 직접 재료다. 차트보다 공시 내용 해석과 시장 반응 확인이 우선이다."
+        if bio.get("headline") != DATA_MISSING:
+            return "디앤디파마텍은 바이오 섹터 뉴스 영향권에 있다. 섹터 강세가 붙는 날만 동반 탄력 기대가 가능하다."
+        return "디앤디파마텍 분석은 데이터 미수집 (개별 시세·거래량·직접 공시 근거 부족)"
+
+    def _dnd_tomorrow_scenario(self, bio: dict[str, str], disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return "공시 재해석이 긍정적으로 이어지면 단기 재상승 시도 가능. 후속 설명이 약하면 변동성만 커지고 방향은 흐려질 수 있다."
+        if bio.get("headline") != DATA_MISSING:
+            return "바이오 섹터 강세가 이어지면 동반 반등 시도 가능. 섹터 식으면 개별주 지속성은 급격히 약해질 수 있다."
+        return "내일 시나리오는 데이터 미수집 (직접 재료 부족)"
+
+    def _dnd_add_rule(self, disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return "추가매수 기준은 데이터 미수집. 공시만 보고 추격하지 말고 장중 거래대금 확대와 눌림 지지 확인 후 판단."
+        return "추가매수 기준은 데이터 미수집 (개별 시세 API 미연동)"
+
+    def _dnd_exit_rule(self, disclosure: str) -> str:
+        if disclosure != DATA_MISSING:
+            return "매도/탈출 기준은 데이터 미수집. 공시 기대가 약해지거나 후속 재료 부재 시 보수적으로 대응."
+        return "매도/탈출 기준은 데이터 미수집 (개별 시세 API 미연동)"
