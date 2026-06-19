@@ -11,6 +11,17 @@ dotenv_path = ".env"
 news_lookback_days = 7
 dart_disclosure_lookback_days = 30
 
+[api.marketaux]
+base_url = "https://api.marketaux.com/v1/news/all"
+enabled_env = "MARKETAUX_API_KEY"
+language = "en"
+limit = 10
+
+[api.krx]
+base_url = "https://data-dbg.krx.co.kr"
+enabled_env = "KRX_API_KEY"
+kospi_daily_path = "/svc/apis/idx/kospi_dd_trd"
+
 [api.kis]
 base_url = "https://openapi.koreainvestment.com:9443"
 token_url = "/oauth2/tokenP"

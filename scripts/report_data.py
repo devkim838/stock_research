@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import re
 import tomllib
 import xml.etree.ElementTree as ET
 import zipfile
@@ -13,7 +14,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -28,6 +29,7 @@ ANALYSIS_PENDING = "필수 데이터 부족으로 분석 보류"
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 ALPHA_BASE_URL = "https://www.alphavantage.co/query"
 NEWS_API_BASE_URL = "https://newsapi.org/v2/everything"
+MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 
@@ -38,6 +40,46 @@ NEWS_RELEVANCE_KEYWORDS = {
     "자동차/현대차": ["hyundai", "kia", "automotive", "ev", "vehicle"],
     "바이오/헬스케어": ["biotech", "healthcare", "clinical", "fda", "drug", "pharma", "trial"],
     "ETF: SCHD, QQQM, SPYG": ["schd", "qqqm", "spyg", "etf", "dividend", "nasdaq"],
+}
+
+MARKETAUX_SEARCH_QUERIES = {
+    "반도체": "semiconductor",
+    "AI": "\"artificial intelligence\" OR Nvidia OR OpenAI OR Microsoft",
+    "로봇": "\"humanoid robot\" OR robotics",
+    "자동차/현대차": "Hyundai EV",
+    "바이오/헬스케어": "FDA drug approval",
+    "ETF: SCHD, QQQM, SPYG": "SCHD",
+}
+
+TRUSTED_NEWS_SOURCES = {
+    "reuters", "bloomberg", "cnbc", "wsj", "financial times", "marketwatch",
+    "barron's", "yahoo finance", "investing.com", "the korea herald", "korea joongang daily",
+    "businesskorea", "pulse", "mk.co.kr", "hankyung", "yna", "yonhap", "pr newswire",
+    "globenewswire", "business wire", "seeking alpha", "the motley fool",
+    "reuters.com", "bloomberg.com", "cnbc.com", "wsj.com", "marketwatch.com",
+    "finance.yahoo.com", "seekingalpha.com", "digitimes.com", "techcrunch.com",
+    "fiercebiotech.com", "endpts.com", "statnews.com",
+}
+
+LOW_QUALITY_SOURCE_KEYWORDS = {
+    "pypi", "github", "gitlab", "npm", "stackoverflow", "reddit", "medium", "substack",
+    "classmethod", "computerworld.dk", "dev.to", "ixbt", "terra.com.br", "digi24",
+    "hwupgrade", "msn", "patch", "blog", "forum", "onefootball",
+}
+
+BLOCKED_URL_KEYWORDS = {
+    "/articles/aws-", "/packages/", "/project/", "/docs/", "/tutorial", "/how-to",
+    "/release-notes", "/tag/", "/category/", "/opinion/", "/lifestyle/", "/sports/",
+    "/entertainment/", "/weather/", "/travel/",
+}
+
+SECTOR_ALLOWED_SOURCES = {
+    "반도체": {"reuters", "bloomberg", "digitimes", "cnbc", "wsj", "marketwatch", "businesskorea", "hankyung", "yonhap", "yna", "finance.yahoo.com", "seekingalpha.com", "digitimes.com"},
+    "AI": {"reuters", "bloomberg", "cnbc", "wsj", "marketwatch", "the information", "venturebeat", "techcrunch", "financial times", "yahoo finance", "finance.yahoo.com", "techcrunch.com"},
+    "로봇": {"reuters", "bloomberg", "digitimes", "cnbc", "wsj", "marketwatch", "businesskorea", "yonhap", "yna", "finance.yahoo.com", "forbes.com", "businesswire.com", "prnewswire.com"},
+    "자동차/현대차": {"reuters", "bloomberg", "cnbc", "wsj", "marketwatch", "pr newswire", "business wire", "yonhap", "yna", "hankyung", "businesskorea", "finance.yahoo.com", "zacks.com", "thehindubusinessline.com"},
+    "바이오/헬스케어": {"reuters", "bloomberg", "cnbc", "wsj", "marketwatch", "fiercebiotech", "endpoints", "stat", "business wire", "globenewswire", "fiercebiotech.com", "endpts.com", "statnews.com", "finance.yahoo.com", "rttnews.com", "thehindubusinessline.com"},
+    "ETF: SCHD, QQQM, SPYG": {"reuters", "bloomberg", "cnbc", "wsj", "marketwatch", "seeking alpha", "morningstar", "yahoo finance", "investing.com", "finance.yahoo.com", "seekingalpha.com"},
 }
 
 TITLE_TRANSLATION_RULES = {
@@ -115,6 +157,7 @@ AUTO_STOCK_CANDIDATES = {
 class NewsItem:
     sector: str
     title: str
+    description: str
     source: str
     published_at: str
     url: str
@@ -191,15 +234,21 @@ class ApiClient:
     def __init__(self) -> None:
         self.fred_key = os.getenv("FRED_API_KEY")
         self.news_key = os.getenv("NEWS_API_KEY")
+        self.marketaux_key = os.getenv(CONFIG["api"]["marketaux"]["enabled_env"])
         self.alpha_key = os.getenv("ALPHA_VANTAGE_API_KEY")
         self.dart_key = os.getenv("DART_API_KEY")
+        self.krx_key = os.getenv(CONFIG["api"]["krx"]["enabled_env"])
         self.kis_app_key = os.getenv(CONFIG["api"]["kis"]["enabled_env"])
         self.kis_app_secret = os.getenv(CONFIG["api"]["kis"]["app_secret_env"])
         self.kis_access_token: str | None = None
         self._corp_code_map: dict[str, str] | None = None
+        self.krx_last_error: str | None = None
 
     def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any] | None:
-        request = Request(url, headers=headers or {"User-Agent": "devkim-research/1.0"})
+        merged_headers = {"User-Agent": "devkim-research/1.0"}
+        if headers:
+            merged_headers.update(headers)
+        request = Request(url, headers=merged_headers)
         try:
             with urlopen(request, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -239,7 +288,7 @@ class ApiClient:
         query.update(params)
         return self.get_json(f"{ALPHA_BASE_URL}?{urlencode(query)}")
 
-    def news_everything(self, query: str, page_size: int = 3) -> list[NewsItem]:
+    def news_everything(self, query: str, target_date: date | None = None, page_size: int = 3) -> list[NewsItem]:
         if not self.news_key:
             return []
         params = {
@@ -248,6 +297,10 @@ class ApiClient:
             "pageSize": str(page_size),
             "apiKey": self.news_key,
         }
+        if target_date is not None:
+            lookback_days = int(CONFIG["api"]["news_lookback_days"])
+            params["from"] = (target_date - timedelta(days=lookback_days)).isoformat()
+            params["to"] = target_date.isoformat()
         payload = self.get_json(f"{NEWS_API_BASE_URL}?{urlencode(params)}")
         if not payload or payload.get("status") != "ok":
             return []
@@ -257,12 +310,60 @@ class ApiClient:
                 NewsItem(
                     sector="",
                     title=article.get("title") or DATA_MISSING,
+                    description=article.get("description") or DATA_MISSING,
                     source=(article.get("source") or {}).get("name") or DATA_MISSING,
                     published_at=article.get("publishedAt") or DATA_MISSING,
                     url=article.get("url") or DATA_MISSING,
                 )
             )
         return items
+
+    def marketaux_news(self, query: str, target_date: date | None = None, page_size: int | None = None) -> list[NewsItem]:
+        if not self.marketaux_key:
+            return []
+        marketaux = CONFIG["api"]["marketaux"]
+        limit = page_size or int(marketaux["limit"])
+        params = {
+            "api_token": self.marketaux_key,
+            "search": query,
+            "language": marketaux["language"],
+            "limit": str(limit),
+            "sort": "published_desc",
+        }
+        if target_date is not None:
+            lookback_days = int(CONFIG["api"]["news_lookback_days"])
+            params["published_after"] = (target_date - timedelta(days=lookback_days)).isoformat()
+            params["published_before"] = f"{target_date.isoformat()}T23:59:59"
+        payload = self.get_json(f"{MARKETAUX_BASE_URL}?{urlencode(params)}")
+        if not payload:
+            return []
+        items: list[NewsItem] = []
+        for article in payload.get("data", []):
+            description = article.get("description") or article.get("snippet") or DATA_MISSING
+            items.append(
+                NewsItem(
+                    sector="",
+                    title=article.get("title") or DATA_MISSING,
+                    description=description,
+                    source=article.get("source") or DATA_MISSING,
+                    published_at=article.get("published_at") or DATA_MISSING,
+                    url=article.get("url") or DATA_MISSING,
+                )
+            )
+        return items
+
+    def combined_news(self, query: str, target_date: date | None = None, page_size: int = 10, marketaux_query: str | None = None) -> list[NewsItem]:
+        articles = self.marketaux_news(marketaux_query or query, target_date=target_date, page_size=page_size)
+        articles.extend(self.news_everything(query, target_date=target_date, page_size=page_size))
+        unique: list[NewsItem] = []
+        seen: set[tuple[str, str]] = set()
+        for article in articles:
+            key = ((article.url or "").strip().lower(), (article.title or "").strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(article)
+        return unique
 
     def alpha_symbol_search(self, keywords: str) -> str | None:
         payload = self.alpha_query("SYMBOL_SEARCH", keywords=keywords)
@@ -272,6 +373,53 @@ class ApiClient:
         if not matches:
             return None
         return matches[0].get("1. symbol")
+
+    def krx_query(self, path: str, **params: str) -> dict[str, Any] | None:
+        if not self.krx_key:
+            return None
+        query = dict(params)
+        base = CONFIG["api"]["krx"]["base_url"]
+        url = f"{base}{path}?{urlencode(query)}"
+        request = Request(
+            url,
+            headers={
+                "AUTH_KEY": self.krx_key,
+                "User-Agent": "devkim-research/1.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                self.krx_last_error = None
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            try:
+                body = error.read().decode("utf-8")
+                payload = json.loads(body)
+                resp_code = payload.get("respCode")
+                resp_msg = payload.get("respMsg")
+                if resp_code and resp_msg:
+                    self.krx_last_error = f"{resp_code} {resp_msg}"
+                else:
+                    self.krx_last_error = f"HTTP {error.code}"
+            except (OSError, json.JSONDecodeError):
+                self.krx_last_error = f"HTTP {error.code}"
+            return None
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            self.krx_last_error = "응답 파싱 실패"
+            return None
+
+    def krx_kospi_daily(self, bas_date: str) -> list[dict[str, Any]]:
+        payload = self.krx_query(
+            CONFIG["api"]["krx"]["kospi_daily_path"],
+            basDd=bas_date,
+        )
+        if not payload:
+            return []
+        items = payload.get("OutBlock_1")
+        if not items:
+            return []
+        return items if isinstance(items, list) else [items]
 
     def dart_disclosures(self, corp_name: str, target_date: date, lookback_days: int = 30) -> list[DisclosureItem]:
         corp_code = self.dart_corp_code(corp_name)
@@ -395,9 +543,9 @@ class ReportDataBuilder:
 
     def build(self, session: str, target_date: date) -> dict[str, Any]:
         common = self._build_common_data(target_date)
-        sectors = self._build_sector_data()
+        sectors = self._build_sector_data(target_date)
         disclosures = self._build_disclosures(target_date)
-        hyundai = self._build_hyundai_data()
+        hyundai = self._build_hyundai_data(target_date)
         session_data = self._build_session_data(session, common, hyundai, sectors, disclosures)
         return {
             "session": session_data,
@@ -411,10 +559,10 @@ class ReportDataBuilder:
 
     def _build_common_data(self, target_date: date) -> dict[str, dict[str, str]]:
         fred = self._build_fred_snapshot(target_date)
+        krx_market = self._build_krx_market_data(target_date)
         kis_market = self._build_kis_market_data()
         return {
             "market_summary": {
-                "indices": self._market_summary_text(fred),
                 "structure": self._macro_structure_text(fred),
                 "drivers": self._market_driver_text(fred),
                 "sentiment": self._market_sentiment_text(fred),
@@ -425,7 +573,7 @@ class ReportDataBuilder:
                 "analysis": self._rate_analysis(fred["us10y"]),
             },
             "korea_market": {
-                "kospi": kis_market["kospi"],
+                "kospi": self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
                 "kosdaq": kis_market["kosdaq"],
                 "leaders": kis_market["leaders"],
                 "breadth": kis_market["breadth"],
@@ -437,7 +585,12 @@ class ReportDataBuilder:
                 "analysis": kis_market["analysis"],
             },
             "missing_reasons": {
-                "korea_index": kis_market["korea_index_reason"],
+                "korea_index": self._compose_korea_index_reason(
+                    self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
+                    kis_market["kosdaq"],
+                    krx_market["korea_index_reason"],
+                    kis_market["korea_index_reason"],
+                ),
                 "investor_flow": kis_market["investor_flow_reason"],
             },
         }
@@ -458,6 +611,44 @@ class ReportDataBuilder:
                 "text": f"{_fmt_number(latest_val)} ({_compact_iso(latest[-1]['date'])})" if latest_val is not None and latest else DATA_MISSING,
             }
         return output
+
+    def _build_krx_market_data(self, target_date: date) -> dict[str, str]:
+        if not self.client.krx_key:
+            return {
+                "kospi": DATA_MISSING,
+                "korea_index_reason": "KRX_API_KEY 환경변수 미설정",
+            }
+        for days_back in range(1, 8):
+            query_date = (target_date - timedelta(days=days_back)).strftime("%Y%m%d")
+            rows = self.client.krx_kospi_daily(query_date)
+            if not rows:
+                continue
+            row = self._select_krx_kospi_row(rows)
+            if not row:
+                continue
+            close_value = self._fmt_krx_number(row.get("CLSPRC_IDX"))
+            diff_value = self._fmt_signed_krx_value(row.get("CMPPREVDD_IDX"))
+            rate_value = self._fmt_percent_krx_value(row.get("FLUC_RT"))
+            high_low = self._fmt_krx_high_low(row.get("HGPRC_IDX"), row.get("LWPRC_IDX"))
+            trade_value = self._fmt_krx_int(row.get("ACC_TRDVAL"))
+            pieces = [close_value]
+            if diff_value != DATA_MISSING:
+                pieces.append(f"전일대비 {diff_value}")
+            if rate_value != DATA_MISSING:
+                pieces.append(f"등락률 {rate_value}")
+            if high_low != DATA_MISSING:
+                pieces.append(f"고가/저가 {high_low}")
+            if trade_value != DATA_MISSING:
+                pieces.append(f"거래대금 {trade_value}")
+            return {
+                "kospi": " | ".join(pieces),
+                "korea_index_reason": DATA_MISSING,
+            }
+        reason = self.client.krx_last_error or "최근 7영업일 내 KOSPI 일별시세 응답 없음"
+        return {
+            "kospi": DATA_MISSING,
+            "korea_index_reason": f"KRX KOSPI 일별시세 API 미수집 ({reason})",
+        }
 
     def _build_kis_market_data(self) -> dict[str, str]:
         kis = CONFIG["api"]["kis"]
@@ -533,9 +724,10 @@ class ReportDataBuilder:
             "forced_liquidation": DATA_MISSING,
         }
 
-    def _build_hyundai_data(self) -> dict[str, str]:
+    def _build_hyundai_data(self, target_date: date) -> dict[str, str]:
         company = next(item for item in self.tracked_companies if item["name"] == "현대차")
         kis_hyundai = self._build_kis_hyundai_data()
+        krx_hyundai = self._build_krx_hyundai_data(target_date)
         symbol = os.getenv("HYUNDAI_ALPHA_SYMBOL") or company.get("alpha_symbol") or self._resolve_alpha_symbol(company)
         quote = self.client.alpha_query("GLOBAL_QUOTE", symbol=symbol) or {}
         daily = self.client.alpha_query("TIME_SERIES_DAILY", symbol=symbol, outputsize="full") or {}
@@ -576,16 +768,16 @@ class ReportDataBuilder:
         ma60 = _rolling_average(closes, 60)
         return {
             "symbol": symbol or DATA_MISSING,
-            "current_close": kis_hyundai["current_close"] if kis_hyundai["current_close"] != DATA_MISSING else _fmt_number(current_price),
-            "previous_close": kis_hyundai["previous_close"] if kis_hyundai["previous_close"] != DATA_MISSING else _fmt_number(prev_close),
-            "volume": kis_hyundai["volume"] if kis_hyundai["volume"] != DATA_MISSING else _fmt_int(current_volume),
+            "current_close": self._prefer_values(kis_hyundai["current_close"], krx_hyundai["current_close"], _fmt_number(current_price)),
+            "previous_close": self._prefer_values(kis_hyundai["previous_close"], krx_hyundai["previous_close"], _fmt_number(prev_close)),
+            "volume": self._prefer_values(kis_hyundai["volume"], krx_hyundai["volume"], _fmt_int(current_volume)),
             "week52_high": _fmt_number(max(highs[:252]) if highs else None),
             "week52_low": _fmt_number(min(lows[:252]) if lows else None),
-            "intraday_high_low": kis_hyundai["intraday_high_low"] if kis_hyundai["intraday_high_low"] != DATA_MISSING else self._combine_values(intraday_high, intraday_low),
+            "intraday_high_low": self._prefer_values(kis_hyundai["intraday_high_low"], krx_hyundai["intraday_high_low"], self._combine_values(intraday_high, intraday_low)),
             "foreign_flow": kis_hyundai["foreign_flow"],
             "institutional_flow": kis_hyundai["institutional_flow"],
             "retail_flow": kis_hyundai["retail_flow"],
-            "short_selling": kis_hyundai["short_selling"],
+            "short_selling": self._prefer_values(kis_hyundai["short_selling"], krx_hyundai["short_selling"]),
             "forced_liquidation": kis_hyundai["forced_liquidation"],
             "ma5": _fmt_number(_rolling_average(closes, 5)),
             "ma20": _fmt_number(ma20),
@@ -598,6 +790,15 @@ class ReportDataBuilder:
             "exit_rule": self._hyundai_exit_rule(current_price, ma20),
         }
 
+    def _build_krx_hyundai_data(self, target_date: date) -> dict[str, str]:
+        return {
+            "current_close": DATA_MISSING,
+            "previous_close": DATA_MISSING,
+            "volume": DATA_MISSING,
+            "intraday_high_low": DATA_MISSING,
+            "short_selling": DATA_MISSING,
+        }
+
     def _resolve_alpha_symbol(self, company: dict[str, Any]) -> str | None:
         for keyword in company.get("alpha_search_keywords", []):
             symbol = self.client.alpha_symbol_search(keyword)
@@ -605,15 +806,18 @@ class ReportDataBuilder:
                 return symbol
         return None
 
-    def _build_sector_data(self) -> dict[str, dict[str, str]]:
+    def _build_sector_data(self, target_date: date) -> dict[str, dict[str, str]]:
         sector_data: dict[str, dict[str, str]] = {}
         for sector, query in self.news_queries.items():
-            articles = self.client.news_everything(query, page_size=10)
+            marketaux_query = MARKETAUX_SEARCH_QUERIES.get(sector, query)
+            articles = self.client.combined_news(query, target_date=target_date, page_size=10, marketaux_query=marketaux_query)
             top = self._select_relevant_article(sector, articles)
             localized_title = self._localize_headline(sector, top.title if top else DATA_MISSING)
+            localized_description = self._localize_description(sector, localized_title, top.description if top else DATA_MISSING)
             data = {
                 "headline": localized_title,
                 "headline_original": top.title if top else DATA_MISSING,
+                "headline_description": localized_description,
                 "source": top.source if top else DATA_MISSING,
                 "published_at": top.published_at if top else DATA_MISSING,
                 "url": top.url if top else DATA_MISSING,
@@ -624,7 +828,7 @@ class ReportDataBuilder:
                 "risk": self._risk_from_headline(localized_title),
             }
             if sector == "바이오/헬스케어":
-                data.update(self._build_bio_sector_data())
+                data.update(self._build_bio_sector_data(target_date))
             sector_data[sector] = data
         return sector_data
 
@@ -656,37 +860,127 @@ class ReportDataBuilder:
             return "SCHD·QQQM·SPYG 등 ETF 비교 또는 운용 관련 해외 뉴스"
         return headline
 
+    def _localize_description(self, sector: str, localized_title: str, description: str) -> str:
+        if description == DATA_MISSING:
+            return DATA_MISSING
+        if _contains_korean(description):
+            return description
+        if sector == "반도체":
+            return f"{localized_title} 관련 기사로, 반도체 업종의 실적 기대와 밸류에이션 해석이 핵심이다."
+        if sector == "AI":
+            return f"{localized_title} 관련 기사로, AI 투자 지출이 실제 수익성으로 연결되는지 점검하는 내용이다."
+        if sector == "로봇":
+            return f"{localized_title} 관련 기사로, 로봇 상용화 속도와 경쟁 심리 변화에 영향을 줄 수 있다."
+        if sector == "자동차/현대차":
+            return f"{localized_title} 관련 기사로, 전기차 전개 속도와 자동차 수요 흐름 점검에 의미가 있다."
+        if sector == "바이오/헬스케어":
+            return f"{localized_title} 관련 기사로, 허가·임상·신약 모멘텀 측면에서 바이오 투자심리에 영향을 줄 수 있다."
+        if sector == "ETF: SCHD, QQQM, SPYG":
+            return f"{localized_title} 관련 기사로, 배당형과 성장형 ETF의 상대 매력 비교에 참고할 수 있다."
+        return "영문 기사 요약은 한국어 해석 로직으로 치환됨"
+
     def _select_relevant_article(self, sector: str, articles: list[NewsItem]) -> NewsItem | None:
         if not articles:
             return None
         keywords = NEWS_RELEVANCE_KEYWORDS.get(sector, [])
-        ranked = sorted(
-            articles,
-            key=lambda article: self._relevance_score(article, keywords),
-            reverse=True,
-        )
+        filtered = [article for article in articles if not self._is_low_quality_article(article, sector)]
+        filtered = [article for article in filtered if self._is_allowed_source(article, sector)]
+        if not filtered:
+            return None
+        ranked = sorted(filtered, key=lambda article: self._relevance_score(article, keywords), reverse=True)
         top = ranked[0]
-        if self._relevance_score(top, keywords) == 0:
+        if self._relevance_score(top, keywords) <= 0:
             return None
         return top
 
     def _relevance_score(self, article: NewsItem, keywords: list[str]) -> int:
-        haystack = f"{article.title} {article.source} {article.url}".lower()
-        return sum(1 for keyword in keywords if keyword in haystack)
+        haystack = f"{article.title} {article.description} {article.source} {article.url}".lower()
+        score = sum(2 for keyword in keywords if self._keyword_present(haystack, keyword))
+        source = (article.source or "").lower()
+        url = (article.url or "").lower()
+        domain = urlparse(url).netloc.lower()
+        if any(source_name in source for source_name in TRUSTED_NEWS_SOURCES):
+            score += 3
+        if any(source_name in domain for source_name in TRUSTED_NEWS_SOURCES):
+            score += 2
+        if self._contains_market_structure_terms(haystack):
+            score += 1
+        if self._is_low_quality_article(article, ""):
+            score -= 5
+        return score
 
-    def _build_bio_sector_data(self) -> dict[str, str]:
-        clinical = self.client.news_everything("clinical trial biotech", page_size=1)
-        fda = self.client.news_everything("FDA biotech drug approval", page_size=1)
-        licensing = self.client.news_everything("biotech licensing deal", page_size=1)
-        dnd = self.client.news_everything("\"D&D Pharmatech\" OR \"디앤디파마텍\"", page_size=1)
+    def _is_low_quality_article(self, article: NewsItem, sector: str) -> bool:
+        haystack = f"{article.title} {article.description} {article.source} {article.url}".lower()
+        domain = urlparse((article.url or "").lower()).netloc
+        if any(keyword in haystack for keyword in LOW_QUALITY_SOURCE_KEYWORDS):
+            return True
+        if any(keyword in (article.url or "").lower() for keyword in BLOCKED_URL_KEYWORDS):
+            return True
+        if sector == "자동차/현대차" and not any(self._keyword_present(haystack, word) for word in ("hyundai", "kia", "automotive", "ev", "vehicle", "electric vehicle")):
+            return True
+        if sector == "AI" and not any(self._keyword_present(haystack, word) for word in ("ai", "artificial intelligence", "llm", "nvidia", "openai", "microsoft", "generative ai")):
+            return True
+        if sector == "로봇" and not any(self._keyword_present(haystack, word) for word in ("robot", "robotics", "humanoid", "automation")):
+            return True
+        if sector == "반도체" and not any(self._keyword_present(haystack, word) for word in ("semiconductor", "chip", "memory", "hbm", "foundry", "samsung", "hynix")):
+            return True
+        if sector == "바이오/헬스케어" and not any(self._keyword_present(haystack, word) for word in ("biotech", "healthcare", "clinical", "fda", "drug", "pharma", "trial", "ultrasound", "medical")):
+            return True
+        return False
+
+    def _contains_market_structure_terms(self, haystack: str) -> bool:
+        return any(
+            keyword in haystack
+            for keyword in (
+                "guidance", "earnings", "forecast", "demand", "supply", "investment",
+                "production", "shipment", "approval", "trial", "tariff", "policy",
+            )
+        )
+
+    def _is_allowed_source(self, article: NewsItem, sector: str) -> bool:
+        allowed = SECTOR_ALLOWED_SOURCES.get(sector)
+        if not allowed:
+            return True
+        source = (article.source or "").lower()
+        domain = urlparse((article.url or "").lower()).netloc
+        return any(name in source or name in domain for name in allowed)
+
+    def _keyword_present(self, haystack: str, keyword: str) -> bool:
+        normalized = keyword.lower().strip()
+        if " " in normalized:
+            return normalized in haystack
+        if len(normalized) <= 3:
+            return bool(re.search(rf"(?<![a-z]){re.escape(normalized)}(?![a-z])", haystack))
+        return normalized in haystack
+
+    def _build_bio_sector_data(self, target_date: date) -> dict[str, str]:
+        clinical = self.client.combined_news("clinical trial biotech", target_date=target_date, page_size=3)
+        fda = self.client.combined_news("FDA biotech drug approval", target_date=target_date, page_size=3)
+        licensing = self.client.combined_news("biotech licensing deal", target_date=target_date, page_size=3)
+        dnd = self.client.combined_news("\"D&D Pharmatech\" OR \"디앤디파마텍\"", target_date=target_date, page_size=3)
         return {
             "leaders": "삼성바이오로직스, 셀트리온, 유한양행, 디앤디파마텍",
-            "clinical_news": clinical[0].title if clinical else DATA_MISSING,
-            "fda_news": fda[0].title if fda else DATA_MISSING,
-            "licensing_news": licensing[0].title if licensing else DATA_MISSING,
+            "clinical_news": self._localize_bio_extra("임상", clinical[0].title) if clinical else DATA_MISSING,
+            "fda_news": self._localize_bio_extra("FDA", fda[0].title) if fda else DATA_MISSING,
+            "licensing_news": self._localize_bio_extra("기술수출", licensing[0].title) if licensing else DATA_MISSING,
             "rate_impact": "금리 데이터와 바이오 뉴스의 방향이 동시에 확인될 때만 비중 확대." if fda or clinical or licensing else ANALYSIS_PENDING,
-            "dnd_comment": dnd[0].title if dnd else DATA_MISSING,
+            "dnd_comment": self._localize_bio_extra("디앤디파마텍", dnd[0].title) if dnd else DATA_MISSING,
         }
+
+    def _localize_bio_extra(self, category: str, title: str) -> str:
+        if title == DATA_MISSING:
+            return DATA_MISSING
+        if _contains_korean(title):
+            return title
+        if category == "임상":
+            return "해외 바이오 임상 관련 기사 확인"
+        if category == "FDA":
+            return "해외 FDA 승인 또는 허가 관련 기사 확인"
+        if category == "기술수출":
+            return "해외 기술수출 또는 제휴 관련 기사 확인"
+        if category == "디앤디파마텍":
+            return "디앤디파마텍 직접 언급 해외 기사 미수집, 동종 바이오 모멘텀만 참고"
+        return "해외 바이오 기사 확인"
 
     def _build_disclosures(self, target_date: date) -> dict[str, Any]:
         items_by_company: dict[str, list[DisclosureItem]] = {}
@@ -841,19 +1135,30 @@ class ReportDataBuilder:
     ) -> dict[str, str]:
         fred_ok = "연결됨" if common["fred"]["us10y"]["text"] != DATA_MISSING else "미연결"
         news_ok = "연결됨" if any(data.get("headline") != DATA_MISSING for data in sectors.values()) else "미연결"
+        marketaux_ok = "연결됨" if self.client.marketaux_key else "미연결"
         dart_ok = "연결됨" if disclosures.get("recent") != DATA_MISSING else "미연결"
         alpha_ok = "부분 연결" if hyundai.get("current_close") != DATA_MISSING else "미연결"
+        krx_ok = "연결됨" if common["korea_market"]["kospi"] != DATA_MISSING else ("권한 오류" if self.client.krx_key and self.client.krx_last_error else "미연결")
         kis_key_name = self.api_config["kis"]["enabled_env"]
         kis_secret_name = self.api_config["kis"]["app_secret_env"]
         kis_ok = "준비됨" if os.getenv(kis_key_name) and os.getenv(kis_secret_name) else "미연결"
+        if self.client.krx_key and self.client.krx_last_error:
+            hyundai_reason = f"KRX_API_KEY는 설정됐지만 현재 연결된 스펙은 KOSPI 지수용이며, 현대차 개별종목 API는 아직 미연동 상태. KRX 최근 오류: {self.client.krx_last_error}"
+        elif alpha_ok != "미연결":
+            hyundai_reason = "Alpha Vantage 심볼 데이터가 OTC 기준이라 이동평균/52주 범위가 불완전할 수 있음"
+        else:
+            hyundai_reason = "현대차 가격 데이터 미수집"
         return {
             "fred_status": fred_ok,
             "news_status": news_ok,
+            "marketaux_status": marketaux_ok,
             "alpha_status": alpha_ok,
             "dart_status": dart_ok,
+            "krx_status": krx_ok,
             "kis_status": kis_ok,
+            "krx_reason": common["missing_reasons"]["korea_index"],
             "kis_reason": f"{kis_key_name} 또는 {kis_secret_name} 환경변수 미설정으로 한국장 지수/수급 미수집" if kis_ok == "미연결" else "KIS 키는 준비됨. 엔드포인트 경로와 응답 파싱 로직 연결 필요",
-            "hyundai_reason": "Alpha Vantage 심볼 데이터가 OTC 기준이라 이동평균/52주 범위가 불완전할 수 있음" if alpha_ok != "미연결" else "현대차 가격 데이터 미수집",
+            "hyundai_reason": hyundai_reason,
             "flow_reason": "외국인/기관/개인 수급은 국내 브로커 또는 거래소 API가 필요함",
             "news_reason": "뉴스는 수집되지만 국내 관련 종목 가격 반응 데이터가 없어 정량 영향 평가는 제한적임",
         }
@@ -896,16 +1201,6 @@ class ReportDataBuilder:
             return None
         return 4 if current >= ma20 else 2
 
-    def _market_summary_text(self, fred: dict[str, Any]) -> str:
-        pieces = [
-            f"미국 10년물 {fred['us10y']['text']}",
-            f"CPI {fred['cpi']['text']}",
-            f"PPI {fred['ppi']['text']}",
-            f"실업률 {fred['unemployment']['text']}",
-            f"연방기금금리 {fred['fed_funds']['text']}",
-        ]
-        return ", ".join(pieces)
-
     def _macro_structure_text(self, fred: dict[str, Any]) -> str:
         if fred["us10y"]["value"] is None or fred["fed_funds"]["value"] is None:
             return ANALYSIS_PENDING
@@ -914,15 +1209,21 @@ class ReportDataBuilder:
         return "금리 부담이 완화되는 구간이면 대형 성장주와 수출주를 함께 점검할 수 있다."
 
     def _market_driver_text(self, fred: dict[str, Any]) -> str:
-        return " | ".join(
-            [
-                f"10년물: {fred['us10y']['text']}",
-                f"CPI: {fred['cpi']['text']}",
-                f"PPI: {fred['ppi']['text']}",
-                f"실업률: {fred['unemployment']['text']}",
-                f"연방기금금리: {fred['fed_funds']['text']}",
-            ]
-        )
+        drivers = []
+        if fred["us10y"]["delta"] is not None:
+            if fred["us10y"]["delta"] > 0:
+                drivers.append("미국 10년물 상승으로 성장주 할인율 부담 확대")
+            else:
+                drivers.append("미국 10년물 안정/하락으로 밸류에이션 부담 완화")
+        if fred["cpi"]["value"] is not None and fred["ppi"]["value"] is not None:
+            drivers.append("물가 둔화 재확인 전까지 인플레이션 경계 유지")
+        if fred["unemployment"]["value"] is not None:
+            drivers.append("고용지표는 경기 둔화와 연착륙 해석이 엇갈릴 수 있어 방향성 확인 필요")
+        if fred["fed_funds"]["value"] is not None:
+            drivers.append("정책금리 고점 유지 여부가 위험자산 선호 회복의 핵심 변수")
+        if not drivers:
+            return ANALYSIS_PENDING
+        return " | ".join(drivers[:3])
 
     def _market_sentiment_text(self, fred: dict[str, Any]) -> str:
         score = self._market_score({"fred": fred})
@@ -1249,6 +1550,54 @@ class ReportDataBuilder:
         if high is None or low is None:
             return DATA_MISSING
         return f"{_fmt_number(high)} / {_fmt_number(low)}"
+
+    def _select_krx_kospi_row(self, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for row in rows:
+            idx_name = str(row.get("IDX_NM", "")).strip().lower()
+            idx_class = str(row.get("IDX_CLSS", "")).strip().lower()
+            if idx_name in {"코스피", "kospi"} or idx_class == "kospi":
+                return row
+        return rows[0] if rows else None
+
+    def _compose_korea_index_reason(self, kospi_value: str, kosdaq_value: str, kospi_reason: str, kosdaq_reason: str) -> str:
+        reasons: list[str] = []
+        if kospi_value == DATA_MISSING:
+            reasons.append(f"KOSPI: {kospi_reason}")
+        if kosdaq_value == DATA_MISSING:
+            reasons.append(f"KOSDAQ: {kosdaq_reason}")
+        return " / ".join(reasons) if reasons else DATA_MISSING
+
+    def _fmt_krx_number(self, value: Any) -> str:
+        return _fmt_number(_safe_float(str(value).replace(",", "")) if value not in (None, "") else None)
+
+    def _fmt_krx_int(self, value: Any) -> str:
+        parsed = _safe_float(str(value).replace(",", "")) if value not in (None, "") else None
+        return _fmt_int(int(parsed) if parsed is not None else None)
+
+    def _fmt_signed_krx_value(self, value: Any) -> str:
+        parsed = _safe_float(str(value).replace(",", "")) if value not in (None, "") else None
+        if parsed is None:
+            return DATA_MISSING
+        sign = "+" if parsed > 0 else ""
+        return f"{sign}{_fmt_number(parsed)}"
+
+    def _fmt_percent_krx_value(self, value: Any) -> str:
+        parsed = _safe_float(str(value).replace(",", "")) if value not in (None, "") else None
+        if parsed is None:
+            return DATA_MISSING
+        sign = "+" if parsed > 0 else ""
+        return f"{sign}{_fmt_number(parsed)}%"
+
+    def _fmt_krx_high_low(self, high: Any, low: Any) -> str:
+        high_value = _safe_float(str(high).replace(",", "")) if high not in (None, "") else None
+        low_value = _safe_float(str(low).replace(",", "")) if low not in (None, "") else None
+        return self._combine_values(high_value, low_value)
+
+    def _prefer_values(self, *values: str) -> str:
+        for value in values:
+            if value != DATA_MISSING:
+                return value
+        return DATA_MISSING
 
     def _hyundai_analysis(self, current: float | None, ma20: float | None, ma60: float | None) -> str:
         if current is None or ma20 is None or ma60 is None:

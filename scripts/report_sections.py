@@ -29,6 +29,32 @@ def stock_label(name: str, sector: str) -> str:
     return f"{name} ({sector})"
 
 
+def build_top_news_lines(report_data: dict | None = None) -> list[str]:
+    sectors = (report_data or {}).get("sectors", {})
+    items: list[tuple[str, str]] = []
+    for sector, data in sectors.items():
+        headline = data.get("headline", DATA_MISSING)
+        description = data.get("headline_description", DATA_MISSING)
+        published_at = data.get("published_at", DATA_MISSING)
+        source = data.get("source", DATA_MISSING)
+        url = data.get("url", DATA_MISSING)
+        if headline == DATA_MISSING:
+            continue
+        if url != DATA_MISSING:
+            if description != DATA_MISSING:
+                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at} | {description}"
+            else:
+                text = f"  - {sector}: [{headline}]({url}) | {source} | {published_at}"
+        else:
+            if description != DATA_MISSING:
+                text = f"  - {sector}: {headline} | {source} | {published_at} | {description}"
+            else:
+                text = f"  - {sector}: {headline} | {source} | {published_at}"
+        items.append((published_at, text))
+    items.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in items[:3]]
+
+
 def build_coverage_section(report_data: dict | None = None) -> str:
     coverage = (report_data or {}).get("coverage", {})
     sections = [
@@ -36,8 +62,11 @@ def build_coverage_section(report_data: dict | None = None) -> str:
         "",
         f"- FRED: {coverage.get('fred_status', DATA_MISSING)}",
         f"- NewsAPI: {coverage.get('news_status', DATA_MISSING)}",
+        f"- MarketAux: {coverage.get('marketaux_status', DATA_MISSING)}",
         f"- Alpha Vantage: {coverage.get('alpha_status', DATA_MISSING)}",
         f"- DART: {coverage.get('dart_status', DATA_MISSING)}",
+        f"- KRX(KOSPI 지수): {coverage.get('krx_status', DATA_MISSING)}",
+        f"- KRX 미수집 이유: {coverage.get('krx_reason', DATA_MISSING)}",
         f"- KIS(한국장 지수/수급): {coverage.get('kis_status', DATA_MISSING)}",
         f"- 한국장 데이터 미수집 이유: {coverage.get('kis_reason', DATA_MISSING)}",
         f"- 현대차 데이터 한계: {coverage.get('hyundai_reason', DATA_MISSING)}",
@@ -58,7 +87,6 @@ def build_common_sections(report_data: dict | None = None) -> str:
         "<!-- TODO: API 연동 시 지수/금리/환율/원자재/수급 데이터를 자동 주입할 것. -->",
         "## 시장 요약",
         "",
-        f"- 주요 지수: {market_summary.get('indices', DATA_MISSING)}",
         f"- 시장 구조 해석: {market_summary.get('structure', ANALYSIS_PENDING)}",
         f"- 오늘/당일 핵심 변수: {market_summary.get('drivers', ANALYSIS_PENDING)}",
         f"- 투자 심리: {market_summary.get('sentiment', ANALYSIS_PENDING)}",
@@ -135,6 +163,7 @@ def build_sector_section(title: str, related_stocks: Iterable[str], data: dict |
         "<!-- TODO: API 연동 시 뉴스 원문, 기사 시각, 관련 종목 반응률을 자동 채움. -->",
         f"- 오늘 핵심 뉴스: {data.get('headline', DATA_MISSING)}",
         f"- 원문 제목: {data.get('headline_original', DATA_MISSING)}",
+        f"- 본문 요약: {data.get('headline_description', DATA_MISSING)}",
         f"- 출처: {data.get('source', DATA_MISSING)}",
         f"- 발행일: {data.get('published_at', DATA_MISSING)}",
         f"- URL: {data.get('url', DATA_MISSING)}",
@@ -169,13 +198,20 @@ def build_sector_section(title: str, related_stocks: Iterable[str], data: dict |
 
 def build_morning_summary_section(report_data: dict | None = None) -> str:
     session_data = (report_data or {}).get("session", {})
-    return "\n".join(
+    lines = [
+        "## 오늘의 1페이지 요약",
+        "",
+        f"- 시장 점수: {session_data.get('market_score', DATA_MISSING)}",
+        f"- 공격 / 중립 / 방어: {session_data.get('stance', DATA_MISSING)}",
+        "- 오늘 가장 중요한 뉴스 3개:",
+    ]
+    top_news_lines = build_top_news_lines(report_data)
+    if top_news_lines:
+        lines.extend(top_news_lines)
+    else:
+        lines.append(f"  - {DATA_MISSING}")
+    lines.extend(
         [
-            "## 오늘의 1페이지 요약",
-            "",
-            f"- 시장 점수: {session_data.get('market_score', DATA_MISSING)}",
-            f"- 공격 / 중립 / 방어: {session_data.get('stance', DATA_MISSING)}",
-            f"- 오늘 가장 중요한 뉴스 3개: {session_data.get('top_news_3', DATA_MISSING)}",
             f"- 세계 주요 이슈: {session_data.get('global_major_issues', DATA_MISSING)}",
             f"- 산업 관련 이슈: {session_data.get('industry_major_issues', DATA_MISSING)}",
             f"- 현재 돈이 몰리는 곳: {session_data.get('capital_flow_now', DATA_MISSING)}",
@@ -187,6 +223,7 @@ def build_morning_summary_section(report_data: dict | None = None) -> str:
             f"- 근거 품질 코멘트: {session_data.get('evidence_comment', ANALYSIS_PENDING)}",
         ]
     )
+    return "\n".join(lines)
 
 
 def build_session_specific_section(session: str, summary_hint: str, report_data: dict | None = None) -> str:
