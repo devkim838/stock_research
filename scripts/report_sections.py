@@ -138,6 +138,8 @@ def build_hyundai_section(report_data: dict | None = None) -> str:
         "",
         build_favorite_stock_block("현대차", hyundai),
         "",
+        build_hyundai_dart_block(hyundai),
+        "",
         build_favorite_stock_block("디앤디파마텍", dnd),
     ]
     return "\n".join(sections)
@@ -174,6 +176,23 @@ def build_favorite_stock_block(name: str, data: dict | None = None) -> str:
             f"- 예측: {data.get('forecast', ANALYSIS_PENDING)}",
             f"- 추가매수 기준: {data.get('add_rule', ANALYSIS_PENDING)}",
             f"- 매도/탈출 기준: {data.get('exit_rule', ANALYSIS_PENDING)}",
+        ]
+    )
+
+
+def build_hyundai_dart_block(data: dict | None = None) -> str:
+    data = data or {}
+    return "\n".join(
+        [
+            "#### DART 기반 재무/자본정책/이벤트",
+            "",
+            f"- 최근 재무제표 기준: {data.get('dart_financial_period', DATA_MISSING)}",
+            f"- 재무제표 요약: {data.get('dart_financial_summary', DATA_MISSING)}",
+            f"- 재무 해석: {data.get('dart_financial_view', ANALYSIS_PENDING)}",
+            f"- 자본 정책 공시: {data.get('dart_capital_policy', DATA_MISSING)}",
+            f"- 자본 정책 해석: {data.get('dart_capital_policy_view', ANALYSIS_PENDING)}",
+            f"- 이벤트성 공시: {data.get('dart_events', DATA_MISSING)}",
+            f"- 이벤트 해석: {data.get('dart_events_view', ANALYSIS_PENDING)}",
         ]
     )
 

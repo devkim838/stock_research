@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
 import math
 import os
 import re
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "research_config.toml"
+KRX_CACHE_DIR = ROOT / ".cache" / "krx"
 
 DATA_MISSING = "데이터 미수집"
 ANALYSIS_PENDING = "필수 데이터 부족으로 분석 보류"
@@ -33,6 +35,7 @@ MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
 YAHOO_CHART_BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
+DART_SINGLE_ACCOUNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
 
 NEWS_RELEVANCE_KEYWORDS = {
     "반도체": ["semiconductor", "memory", "chip", "hbm", "sk hynix", "samsung"],
@@ -191,6 +194,18 @@ class DisclosureItem:
     url: str
 
 
+@dataclass(frozen=True)
+class DartFinancialSnapshot:
+    report_name: str
+    bsns_year: str
+    revenue: int | None
+    operating_income: int | None
+    net_income: int | None
+    assets: int | None
+    liabilities: int | None
+    equity: int | None
+
+
 def _load_config() -> dict[str, Any]:
     with CONFIG_PATH.open("rb") as file:
         return tomllib.load(file)
@@ -226,6 +241,33 @@ def _fmt_pct(value: float | None, digits: int = 2) -> str:
         return DATA_MISSING
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.{digits}f}%"
+
+
+def _parse_int_like(value: str | None) -> int | None:
+    if value is None:
+        return None
+    cleaned = value.replace(",", "").replace(" ", "").strip()
+    if not cleaned or cleaned in {"-", "."}:
+        return None
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
+    if not re.fullmatch(r"-?\d+", cleaned):
+        return None
+    parsed = int(cleaned)
+    return -parsed if negative and parsed > 0 else parsed
+
+
+def _fmt_krw_compact(value: int | None) -> str:
+    if value is None:
+        return DATA_MISSING
+    abs_value = abs(value)
+    sign = "-" if value < 0 else ""
+    if abs_value >= 1_0000_0000_0000:
+        return f"{sign}{abs_value / 1_0000_0000_0000:.1f}조원"
+    if abs_value >= 1_0000_0000:
+        return f"{sign}{round(abs_value / 1_0000_0000):,}억원"
+    return f"{value:,}원"
 
 
 def _latest_valid_observations(observations: list[dict[str, str]], count: int = 2) -> list[dict[str, str]]:
@@ -267,6 +309,28 @@ class ApiClient:
         self.marketaux_rate_limited = False
         self.massive_last_error: str | None = None
         self.massive_rate_limited = False
+
+    def _krx_cache_path(self, path: str, params: dict[str, str]) -> Path:
+        cache_key = json.dumps({"path": path, "params": params}, sort_keys=True, ensure_ascii=True)
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        return KRX_CACHE_DIR / f"{digest}.json"
+
+    def _load_krx_cache(self, path: str, params: dict[str, str]) -> dict[str, Any] | None:
+        cache_path = self._krx_cache_path(path, params)
+        if not cache_path.exists():
+            return None
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _save_krx_cache(self, path: str, params: dict[str, str], payload: dict[str, Any]) -> None:
+        cache_path = self._krx_cache_path(path, params)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            return
 
     def get_json(self, url: str, headers: dict[str, str] | None = None) -> dict[str, Any] | None:
         merged_headers = {"User-Agent": "devkim-research/1.0"}
@@ -502,8 +566,10 @@ class ApiClient:
         )
         try:
             with urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
                 self.krx_last_error = None
-                return json.loads(response.read().decode("utf-8"))
+                self._save_krx_cache(path, query, payload)
+                return payload
         except HTTPError as error:
             try:
                 body = error.read().decode("utf-8")
@@ -516,9 +582,17 @@ class ApiClient:
                     self.krx_last_error = f"HTTP {error.code}"
             except (OSError, json.JSONDecodeError):
                 self.krx_last_error = f"HTTP {error.code}"
+            cached = self._load_krx_cache(path, query)
+            if cached:
+                self.krx_last_error = f"{self.krx_last_error} (cached)"
+                return cached
             return None
         except (URLError, TimeoutError, json.JSONDecodeError):
             self.krx_last_error = "응답 파싱 실패"
+            cached = self._load_krx_cache(path, query)
+            if cached:
+                self.krx_last_error = "응답 파싱 실패 (cached)"
+                return cached
             return None
 
     def krx_kospi_daily(self, bas_date: str) -> list[dict[str, Any]]:
@@ -532,6 +606,45 @@ class ApiClient:
         if not items:
             return []
         return items if isinstance(items, list) else [items]
+
+    def krx_kosdaq_daily(self, bas_date: str) -> list[dict[str, Any]]:
+        payload = self.krx_query(
+            CONFIG["api"]["krx"]["kosdaq_daily_path"],
+            basDd=bas_date,
+        )
+        if not payload:
+            return []
+        items = payload.get("OutBlock_1")
+        if not items:
+            return []
+        return items if isinstance(items, list) else [items]
+
+    def krx_stock_base_info(self, path: str, stock_code: str) -> dict[str, Any] | None:
+        for params in ({"isuCd": stock_code}, {"likeSrtnCd": stock_code}):
+            payload = self.krx_query(path, **params)
+            if not payload:
+                continue
+            items = payload.get("OutBlock_1")
+            if isinstance(items, list) and items:
+                return items[0]
+            if isinstance(items, dict) and items:
+                return items
+        return None
+
+    def krx_stock_daily(self, path: str, bas_date: str, stock_code: str) -> list[dict[str, Any]]:
+        param_candidates = (
+            {"basDd": bas_date, "isuCd": stock_code},
+            {"basDd": bas_date, "likeSrtnCd": stock_code},
+        )
+        for params in param_candidates:
+            payload = self.krx_query(path, **params)
+            if not payload:
+                continue
+            items = payload.get("OutBlock_1")
+            if not items:
+                continue
+            return items if isinstance(items, list) else [items]
+        return []
 
     def dart_disclosures(self, corp_name: str, target_date: date, lookback_days: int = 30) -> list[DisclosureItem]:
         corp_code = self.dart_corp_code(corp_name)
@@ -563,6 +676,22 @@ class ApiClient:
                 )
             )
         return items
+
+    def dart_single_account(self, corp_name: str, bsns_year: int, reprt_code: str) -> list[dict[str, str]]:
+        corp_code = self.dart_corp_code(corp_name)
+        if not self.dart_key or not corp_code:
+            return []
+        params = {
+            "crtfc_key": self.dart_key,
+            "corp_code": corp_code,
+            "bsns_year": str(bsns_year),
+            "reprt_code": reprt_code,
+        }
+        payload = self.get_json(f"{DART_SINGLE_ACCOUNT_URL}?{urlencode(params)}")
+        if not payload or payload.get("status") != "000":
+            return []
+        rows = payload.get("list", [])
+        return rows if isinstance(rows, list) else []
 
     def dart_corp_code(self, corp_name: str) -> str | None:
         if self._corp_code_map is None:
@@ -657,7 +786,7 @@ class ReportDataBuilder:
         common = self._build_common_data(target_date)
         sectors = self._build_sector_data(target_date)
         disclosures = self._build_disclosures(target_date)
-        hyundai = self._build_hyundai_data(target_date)
+        hyundai = self._build_hyundai_data(target_date, disclosures)
         favorites = self._build_favorite_stocks(hyundai, sectors, disclosures)
         session_data = self._build_session_data(session, common, hyundai, sectors, disclosures)
         return {
@@ -694,7 +823,7 @@ class ReportDataBuilder:
             },
             "korea_market": {
                 "kospi": self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
-                "kosdaq": kis_market["kosdaq"],
+                "kosdaq": self._prefer_values(kis_market["kosdaq"], krx_market.get("kosdaq", DATA_MISSING)),
                 "leaders": kis_market["leaders"],
                 "breadth": kis_market["breadth"],
             },
@@ -707,7 +836,7 @@ class ReportDataBuilder:
             "missing_reasons": {
                 "korea_index": self._compose_korea_index_reason(
                     self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
-                    kis_market["kosdaq"],
+                    self._prefer_values(kis_market["kosdaq"], krx_market.get("kosdaq", DATA_MISSING)),
                     krx_market["korea_index_reason"],
                     kis_market["korea_index_reason"],
                 ),
@@ -767,38 +896,39 @@ class ReportDataBuilder:
         if not self.client.krx_key:
             return {
                 "kospi": DATA_MISSING,
+                "kosdaq": DATA_MISSING,
                 "korea_index_reason": "KRX_API_KEY 환경변수 미설정",
             }
+        kospi_value = DATA_MISSING
+        kosdaq_value = DATA_MISSING
+        kospi_reason = DATA_MISSING
+        kosdaq_reason = DATA_MISSING
         for days_back in range(1, 8):
             query_date = (target_date - timedelta(days=days_back)).strftime("%Y%m%d")
-            rows = self.client.krx_kospi_daily(query_date)
-            if not rows:
-                continue
-            row = self._select_krx_kospi_row(rows)
-            if not row:
-                continue
-            close_value = self._fmt_krx_number(row.get("CLSPRC_IDX"))
-            diff_value = self._fmt_signed_krx_value(row.get("CMPPREVDD_IDX"))
-            rate_value = self._fmt_percent_krx_value(row.get("FLUC_RT"))
-            high_low = self._fmt_krx_high_low(row.get("HGPRC_IDX"), row.get("LWPRC_IDX"))
-            trade_value = self._fmt_krx_int(row.get("ACC_TRDVAL"))
-            pieces = [close_value]
-            if diff_value != DATA_MISSING:
-                pieces.append(f"전일대비 {diff_value}")
-            if rate_value != DATA_MISSING:
-                pieces.append(f"등락률 {rate_value}")
-            if high_low != DATA_MISSING:
-                pieces.append(f"고가/저가 {high_low}")
-            if trade_value != DATA_MISSING:
-                pieces.append(f"거래대금 {trade_value}")
-            return {
-                "kospi": " | ".join(pieces),
-                "korea_index_reason": DATA_MISSING,
-            }
-        reason = self.client.krx_last_error or "최근 7영업일 내 KOSPI 일별시세 응답 없음"
+            if kospi_value == DATA_MISSING:
+                rows = self.client.krx_kospi_daily(query_date)
+                row = self._select_krx_index_row(rows, "kospi") if rows else None
+                if row:
+                    kospi_value = self._format_krx_index_row(row)
+                elif self.client.krx_last_error:
+                    kospi_reason = f"KRX KOSPI 일별시세 API 미수집 ({self.client.krx_last_error})"
+            if kosdaq_value == DATA_MISSING:
+                rows = self.client.krx_kosdaq_daily(query_date)
+                row = self._select_krx_index_row(rows, "kosdaq") if rows else None
+                if row:
+                    kosdaq_value = self._format_krx_index_row(row)
+                elif self.client.krx_last_error:
+                    kosdaq_reason = f"KRX KOSDAQ 일별시세 API 미수집 ({self.client.krx_last_error})"
+            if kospi_value != DATA_MISSING and kosdaq_value != DATA_MISSING:
+                break
+        if kospi_reason == DATA_MISSING and kospi_value == DATA_MISSING:
+            kospi_reason = "최근 7영업일 내 KOSPI 일별시세 응답 없음"
+        if kosdaq_reason == DATA_MISSING and kosdaq_value == DATA_MISSING:
+            kosdaq_reason = "최근 7영업일 내 KOSDAQ 일별시세 응답 없음"
         return {
-            "kospi": DATA_MISSING,
-            "korea_index_reason": f"KRX KOSPI 일별시세 API 미수집 ({reason})",
+            "kospi": kospi_value,
+            "kosdaq": kosdaq_value,
+            "korea_index_reason": self._compose_korea_index_reason(kospi_value, kosdaq_value, kospi_reason, kosdaq_reason),
         }
 
     def _build_kis_market_data(self) -> dict[str, str]:
@@ -832,6 +962,95 @@ class ReportDataBuilder:
             "korea_index_reason": "index_price_path 미설정 또는 응답 파싱 로직 미구현" if not index_payload else "응답 파싱 로직 미구현",
             "investor_flow_reason": "investor_flow_path 미설정 또는 응답 파싱 로직 미구현" if not flow_payload else "응답 파싱 로직 미구현",
         }
+
+    def _hyundai_financial_report_candidates(self, target_date: date) -> list[tuple[int, str, str]]:
+        year = target_date.year
+        month = target_date.month
+        if month >= 11:
+            return [
+                (year, "11014", "3분기보고서"),
+                (year, "11012", "반기보고서"),
+                (year, "11013", "1분기보고서"),
+                (year - 1, "11011", "사업보고서"),
+            ]
+        if month >= 8:
+            return [
+                (year, "11012", "반기보고서"),
+                (year, "11013", "1분기보고서"),
+                (year - 1, "11011", "사업보고서"),
+                (year - 1, "11014", "3분기보고서"),
+            ]
+        if month >= 5:
+            return [
+                (year, "11013", "1분기보고서"),
+                (year - 1, "11011", "사업보고서"),
+                (year - 1, "11014", "3분기보고서"),
+                (year - 1, "11012", "반기보고서"),
+            ]
+        return [
+            (year - 1, "11011", "사업보고서"),
+            (year - 1, "11014", "3분기보고서"),
+            (year - 1, "11012", "반기보고서"),
+            (year - 1, "11013", "1분기보고서"),
+        ]
+
+    def _pick_dart_account_amount(self, rows: list[dict[str, str]], account_names: tuple[str, ...]) -> int | None:
+        for fs_div in ("CFS", "OFS"):
+            for row in rows:
+                account_name = (row.get("account_nm") or "").strip()
+                if row.get("fs_div") != fs_div or account_name not in account_names:
+                    continue
+                amount = _parse_int_like(row.get("thstrm_amount")) or _parse_int_like(row.get("thstrm_add_amount"))
+                if amount is not None:
+                    return amount
+        return None
+
+    def _build_hyundai_dart_financial_snapshot(self, target_date: date) -> DartFinancialSnapshot | None:
+        corp_name = "현대자동차"
+        for bsns_year, reprt_code, report_name in self._hyundai_financial_report_candidates(target_date):
+            rows = self.client.dart_single_account(corp_name, bsns_year, reprt_code)
+            if not rows:
+                continue
+            return DartFinancialSnapshot(
+                report_name=report_name,
+                bsns_year=str(bsns_year),
+                revenue=self._pick_dart_account_amount(rows, ("매출액", "영업수익")),
+                operating_income=self._pick_dart_account_amount(rows, ("영업이익", "영업이익(손실)")),
+                net_income=self._pick_dart_account_amount(rows, ("당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익")),
+                assets=self._pick_dart_account_amount(rows, ("자산총계",)),
+                liabilities=self._pick_dart_account_amount(rows, ("부채총계",)),
+                equity=self._pick_dart_account_amount(rows, ("자본총계",)),
+            )
+        return None
+
+    def _hyundai_capital_policy_summary(self, disclosures: list[DisclosureItem]) -> tuple[str, str]:
+        keywords = ("자기주식", "유상증자", "무상증자", "유무상증자", "감자", "전환사채", "신주인수권부사채", "교환사채", "배당")
+        matched = [item for item in disclosures if any(keyword in item.report_name for keyword in keywords)]
+        if not matched:
+            return (
+                "최근 90일 내 자사주·증자·사채·감자 관련 현대차 공시 미수집",
+                "자본정책 새 이벤트가 없으면 주주환원 확대보다 기존 정책 유지로 해석",
+            )
+        top = matched[:3]
+        summary = " | ".join(f"{item.report_name} ({item.filed_at})" for item in top)
+        view = "자기주식·증자·사채 관련 공시는 주주환원 또는 자금조달 신호이므로 headline보다 조건을 확인해야 한다."
+        return summary, view
+
+    def _hyundai_event_summary(self, disclosures: list[DisclosureItem]) -> tuple[str, str]:
+        keywords = (
+            "기업설명회", "실적", "분기보고서", "반기보고서", "사업보고서", "주주총회",
+            "합병", "분할", "영업양수", "영업양도", "유형자산", "타법인 주식", "해외 증권시장",
+        )
+        matched = [item for item in disclosures if any(keyword in item.report_name for keyword in keywords)]
+        if not matched:
+            return (
+                "최근 90일 내 현대차 이벤트성 공시 미수집",
+                "이벤트 공시가 비어 있으면 단기 주가 해석은 뉴스보다 업종 수급과 환율 영향이 더 크다.",
+            )
+        top = matched[:3]
+        summary = " | ".join(f"{item.report_name} ({item.filed_at})" for item in top)
+        view = "IR·정기보고서·구조개편 공시는 숫자와 일정 확인 전까지 기대감만으로 추격하지 않는 편이 낫다."
+        return summary, view
 
     def _build_kis_hyundai_data(self) -> dict[str, str]:
         kis = CONFIG["api"]["kis"]
@@ -875,10 +1094,14 @@ class ReportDataBuilder:
             "forced_liquidation": DATA_MISSING,
         }
 
-    def _build_hyundai_data(self, target_date: date) -> dict[str, str]:
+    def _build_hyundai_data(self, target_date: date, disclosures: dict[str, Any]) -> dict[str, str]:
         company = next(item for item in self.tracked_companies if item["name"] == "현대차")
         kis_hyundai = self._build_kis_hyundai_data()
         krx_hyundai = self._build_krx_hyundai_data(target_date)
+        hyundai_disclosures = disclosures.get("items_by_company", {}).get("현대차", [])
+        dart_financial = self._build_hyundai_dart_financial_snapshot(target_date)
+        capital_policy_summary, capital_policy_view = self._hyundai_capital_policy_summary(hyundai_disclosures)
+        event_summary, event_view = self._hyundai_event_summary(hyundai_disclosures)
         symbol = os.getenv("HYUNDAI_ALPHA_SYMBOL") or company.get("alpha_symbol") or self._resolve_alpha_symbol(company)
         quote = self.client.alpha_query("GLOBAL_QUOTE", symbol=symbol) or {}
         daily = self.client.alpha_query("TIME_SERIES_DAILY", symbol=symbol, outputsize="full") or {}
@@ -911,10 +1134,20 @@ class ReportDataBuilder:
                     latest_volume = int(volume) if volume is not None else None
                 if index == 1:
                     prev_close = close
-        current_price = _safe_float(global_quote.get("05. price")) or latest_close
-        current_volume = int(float(global_quote["06. volume"])) if global_quote.get("06. volume") else latest_volume
-        intraday_high = _safe_float(global_quote.get("03. high")) or latest_high
-        intraday_low = _safe_float(global_quote.get("04. low")) or latest_low
+        krx_close_num = _safe_float(krx_hyundai["current_close"].replace(",", "")) if krx_hyundai["current_close"] != DATA_MISSING else None
+        krx_prev_close_num = _safe_float(krx_hyundai["previous_close"].replace(",", "")) if krx_hyundai["previous_close"] != DATA_MISSING else None
+        krx_volume_num = _parse_int_like(krx_hyundai["volume"]) if krx_hyundai["volume"] != DATA_MISSING else None
+        krx_high_num: float | None = None
+        krx_low_num: float | None = None
+        if krx_hyundai["intraday_high_low"] != DATA_MISSING:
+            high_text, _, low_text = krx_hyundai["intraday_high_low"].partition("/")
+            krx_high_num = _safe_float(high_text.replace(",", "").strip())
+            krx_low_num = _safe_float(low_text.replace(",", "").strip())
+        current_price = krx_close_num or _safe_float(global_quote.get("05. price")) or latest_close
+        prev_close = krx_prev_close_num or prev_close
+        current_volume = krx_volume_num or (int(float(global_quote["06. volume"])) if global_quote.get("06. volume") else latest_volume)
+        intraday_high = krx_high_num or _safe_float(global_quote.get("03. high")) or latest_high
+        intraday_low = krx_low_num or _safe_float(global_quote.get("04. low")) or latest_low
         ma20 = _rolling_average(closes, 20)
         ma60 = _rolling_average(closes, 60)
         return {
@@ -944,9 +1177,58 @@ class ReportDataBuilder:
             "down_reason": self._favorite_down_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
             "up_reason": self._favorite_up_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
             "forecast": self._favorite_forecast(current_price, ma20, ma60, "현대차"),
+            "dart_financial_period": f"{dart_financial.bsns_year} {dart_financial.report_name}" if dart_financial else DATA_MISSING,
+            "dart_financial_summary": (
+                f"매출 {_fmt_krw_compact(dart_financial.revenue)} | 영업이익 {_fmt_krw_compact(dart_financial.operating_income)} | "
+                f"순이익 {_fmt_krw_compact(dart_financial.net_income)} | 자산 {_fmt_krw_compact(dart_financial.assets)} | "
+                f"부채 {_fmt_krw_compact(dart_financial.liabilities)} | 자본 {_fmt_krw_compact(dart_financial.equity)}"
+                if dart_financial else DATA_MISSING
+            ),
+            "dart_financial_view": (
+                "연결 기준 최근 제출 재무제표를 사용한다. 분기 수치는 누적 기준일 수 있으므로 전년 동기와 함께 해석해야 한다."
+                if dart_financial else "DART 재무제표 미수집"
+            ),
+            "dart_capital_policy": capital_policy_summary,
+            "dart_capital_policy_view": capital_policy_view,
+            "dart_events": event_summary,
+            "dart_events_view": event_view,
         }
 
     def _build_krx_hyundai_data(self, target_date: date) -> dict[str, str]:
+        company = next(item for item in self.tracked_companies if item["name"] == "현대차")
+        stock_code = str(company.get("stock_code") or "").strip()
+        market = str(company.get("market") or "KOSPI").upper()
+        if not self.client.krx_key or not stock_code:
+            return {
+                "current_close": DATA_MISSING,
+                "previous_close": DATA_MISSING,
+                "volume": DATA_MISSING,
+                "intraday_high_low": DATA_MISSING,
+                "short_selling": DATA_MISSING,
+            }
+        daily_path = CONFIG["api"]["krx"]["stk_daily_path"] if market == "KOSPI" else CONFIG["api"]["krx"]["ksq_daily_path"]
+        for days_back in range(1, 8):
+            query_date = (target_date - timedelta(days=days_back)).strftime("%Y%m%d")
+            rows = self.client.krx_stock_daily(daily_path, query_date, stock_code)
+            if not rows:
+                continue
+            row = self._select_krx_stock_row(rows, stock_code, "현대차")
+            if not row:
+                continue
+            close_value = self._fmt_krx_number(self._krx_row_value(row, "TDD_CLSPRC", "CLSPRC", "CLSPRC_IDX"))
+            prev_value = self._krx_previous_close_text(row)
+            volume_value = self._fmt_krx_int(self._krx_row_value(row, "ACC_TRDVOL", "TDD_TRDVOL", "TRDVOL"))
+            high_low = self._fmt_krx_high_low(
+                self._krx_row_value(row, "TDD_HGPRC", "HGPRC", "HGPRC_IDX"),
+                self._krx_row_value(row, "TDD_LWPRC", "LWPRC", "LWPRC_IDX"),
+            )
+            return {
+                "current_close": close_value,
+                "previous_close": prev_value,
+                "volume": volume_value,
+                "intraday_high_low": high_low,
+                "short_selling": DATA_MISSING,
+            }
         return {
             "current_close": DATA_MISSING,
             "previous_close": DATA_MISSING,
@@ -1446,8 +1728,10 @@ class ReportDataBuilder:
         kis_key_name = self.api_config["kis"]["enabled_env"]
         kis_secret_name = self.api_config["kis"]["app_secret_env"]
         kis_ok = "준비됨" if os.getenv(kis_key_name) and os.getenv(kis_secret_name) else "미연결"
-        if self.client.krx_key and self.client.krx_last_error:
-            hyundai_reason = f"KRX_API_KEY는 설정됐지만 현재 연결된 스펙은 KOSPI 지수용이며, 현대차 개별종목 API는 아직 미연동 상태. KRX 최근 오류: {self.client.krx_last_error}"
+        if hyundai.get("current_close") != DATA_MISSING and hyundai.get("volume") != DATA_MISSING:
+            hyundai_reason = "KRX 일별매매정보로 현대차 종가·고가·저가·거래량은 연결됨. 투자자 수급·공매도는 추가 API 필요"
+        elif self.client.krx_key and self.client.krx_last_error:
+            hyundai_reason = f"KRX_API_KEY는 설정됐지만 현대차 개별종목 API 응답이 불완전함. KRX 최근 오류: {self.client.krx_last_error}"
         elif alpha_ok != "미연결":
             hyundai_reason = "Alpha Vantage 심볼 데이터가 OTC 기준이라 이동평균/52주 범위가 불완전할 수 있음"
         else:
@@ -1927,13 +2211,68 @@ class ReportDataBuilder:
             return DATA_MISSING
         return f"{_fmt_number(high)} / {_fmt_number(low)}"
 
-    def _select_krx_kospi_row(self, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _krx_row_value(self, row: dict[str, Any], *keys: str) -> Any:
+        lowered = {str(key).lower(): value for key, value in row.items()}
+        for key in keys:
+            if key in row:
+                return row[key]
+            if key.lower() in lowered:
+                return lowered[key.lower()]
+        return None
+
+    def _krx_previous_close_text(self, row: dict[str, Any]) -> str:
+        previous_close = self._krx_row_value(row, "PREV_CLSPRC", "TDD_OPNPRC", "OPNPRC")
+        if previous_close not in (None, ""):
+            return self._fmt_krx_number(previous_close)
+        close_value = _safe_float(str(self._krx_row_value(row, "TDD_CLSPRC", "CLSPRC", "CLSPRC_IDX") or "").replace(",", ""))
+        diff_value = _safe_float(str(self._krx_row_value(row, "CMPPREVDD_PRC", "CMPPREVDD_IDX", "CMPPREVDD") or "").replace(",", ""))
+        if close_value is None or diff_value is None:
+            return DATA_MISSING
+        return _fmt_number(close_value - diff_value)
+
+    def _select_krx_index_row(self, rows: list[dict[str, Any]], market: str) -> dict[str, Any] | None:
         for row in rows:
             idx_name = str(row.get("IDX_NM", "")).strip().lower()
+            if market == "kospi" and idx_name in {"코스피", "kospi"}:
+                return row
+            if market == "kosdaq" and idx_name in {"코스닥", "kosdaq"}:
+                return row
+        for row in rows:
             idx_class = str(row.get("IDX_CLSS", "")).strip().lower()
-            if idx_name in {"코스피", "kospi"} or idx_class == "kospi":
+            if market == "kospi" and idx_class == "kospi":
+                return row
+            if market == "kosdaq" and idx_class == "kosdaq":
                 return row
         return rows[0] if rows else None
+
+    def _select_krx_stock_row(self, rows: list[dict[str, Any]], stock_code: str, stock_name: str) -> dict[str, Any] | None:
+        for row in rows:
+            if str(row.get("ISU_CD", "")).strip() == stock_code:
+                return row
+        for row in rows:
+            if str(row.get("ISU_NM", "")).strip() == stock_name:
+                return row
+        return None
+
+    def _format_krx_index_row(self, row: dict[str, Any]) -> str:
+        close_value = self._fmt_krx_number(self._krx_row_value(row, "CLSPRC_IDX", "TDD_CLSPRC"))
+        diff_value = self._fmt_signed_krx_value(self._krx_row_value(row, "CMPPREVDD_IDX", "CMPPREVDD_PRC"))
+        rate_value = self._fmt_percent_krx_value(self._krx_row_value(row, "FLUC_RT"))
+        high_low = self._fmt_krx_high_low(
+            self._krx_row_value(row, "HGPRC_IDX", "TDD_HGPRC"),
+            self._krx_row_value(row, "LWPRC_IDX", "TDD_LWPRC"),
+        )
+        trade_value = self._fmt_krx_int(self._krx_row_value(row, "ACC_TRDVAL", "TDD_TRDVAL"))
+        pieces = [close_value]
+        if diff_value != DATA_MISSING:
+            pieces.append(f"전일대비 {diff_value}")
+        if rate_value != DATA_MISSING:
+            pieces.append(f"등락률 {rate_value}")
+        if high_low != DATA_MISSING:
+            pieces.append(f"고가/저가 {high_low}")
+        if trade_value != DATA_MISSING:
+            pieces.append(f"거래대금 {trade_value}")
+        return " | ".join(pieces)
 
     def _compose_korea_index_reason(self, kospi_value: str, kosdaq_value: str, kospi_reason: str, kosdaq_reason: str) -> str:
         reasons: list[str] = []

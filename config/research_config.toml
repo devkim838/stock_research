@@ -26,7 +26,13 @@ limit = 50
 [api.krx]
 base_url = "https://data-dbg.krx.co.kr"
 enabled_env = "KRX_API_KEY"
+krx_daily_path = "/svc/apis/idx/krx_dd_trd"
 kospi_daily_path = "/svc/apis/idx/kospi_dd_trd"
+kosdaq_daily_path = "/svc/apis/idx/kosdaq_dd_trd"
+stk_daily_path = "/svc/apis/sto/stk_bydd_trd"
+ksq_daily_path = "/svc/apis/sto/ksq_bydd_trd"
+stk_base_info_path = "/svc/apis/sto/stk_isu_base_info"
+ksq_base_info_path = "/svc/apis/sto/ksq_isu_base_info"
 
 [api.kis]
 base_url = "https://openapi.koreainvestment.com:9443"
@@ -60,14 +66,19 @@ name = "현대차"
 dart_name = "현대자동차"
 alpha_symbol = "HYMLF"
 alpha_search_keywords = ["Hyundai Motor", "005380"]
+market = "KOSPI"
+stock_code = "005380"
 
 [[tracked_companies]]
 name = "삼성전자"
 dart_name = "삼성전자"
+market = "KOSPI"
+stock_code = "005930"
 
 [[tracked_companies]]
 name = "디앤디파마텍"
 dart_name = "디앤디파마텍"
+market = "KOSDAQ"
 
 [naming]
 daily_pattern = "{date}-{session}.md"
