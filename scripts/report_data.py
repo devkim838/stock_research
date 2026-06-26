@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import re
+import calendar
 import tomllib
 import xml.etree.ElementTree as ET
 import zipfile
@@ -33,6 +34,8 @@ ALPHA_BASE_URL = "https://www.alphavantage.co/query"
 NEWS_API_BASE_URL = "https://newsapi.org/v2/everything"
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
 YAHOO_CHART_BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+YAHOO_QUOTE_SUMMARY_URL = "https://query1.finance.yahoo.com/v10/finance/quoteSummary"
+FNGUIDE_MAIN_URL = "https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DART_CORP_CODE_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 DART_SINGLE_ACCOUNT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
@@ -165,6 +168,22 @@ AUTO_STOCK_CANDIDATES = {
     "바이오/헬스케어": ["삼성바이오로직스", "셀트리온", "유한양행"],
 }
 
+EXTRA_COMPANY_METADATA = {
+    "SK하이닉스": {"market": "KOSPI", "stock_code": "000660"},
+    "한미반도체": {"market": "KOSPI", "stock_code": "042700"},
+    "네이버": {"market": "KOSPI", "stock_code": "035420"},
+    "카카오": {"market": "KOSPI", "stock_code": "035720"},
+    "기아": {"market": "KOSPI", "stock_code": "000270"},
+    "현대모비스": {"market": "KOSPI", "stock_code": "012330"},
+    "현대오토에버": {"market": "KOSPI", "stock_code": "307950"},
+    "삼성바이오로직스": {"market": "KOSPI", "stock_code": "207940"},
+    "셀트리온": {"market": "KOSPI", "stock_code": "068270"},
+    "유한양행": {"market": "KOSPI", "stock_code": "000100"},
+    "레인보우로보틱스": {"market": "KOSDAQ", "stock_code": "277810"},
+    "두산로보틱스": {"market": "KOSPI", "stock_code": "454910"},
+    "로보스타": {"market": "KOSDAQ", "stock_code": "090360"},
+}
+
 SECTOR_DART_COMPANIES = {
     "반도체": ["삼성전자", "SK하이닉스", "한미반도체"],
     "AI": ["NAVER", "카카오"],
@@ -243,6 +262,12 @@ def _fmt_pct(value: float | None, digits: int = 2) -> str:
     return f"{sign}{value:.{digits}f}%"
 
 
+def _fmt_ratio(value: float | None, digits: int = 2) -> str:
+    if value is None or math.isnan(value):
+        return DATA_MISSING
+    return f"{value:.{digits}f}"
+
+
 def _parse_int_like(value: str | None) -> int | None:
     if value is None:
         return None
@@ -285,6 +310,33 @@ def _compact_iso(value: str) -> str:
     if len(value) == 8 and value.isdigit():
         return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     return value
+
+
+def _shift_months(base_date: date, months: int) -> date:
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(base_date.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _snapshot_text(value: float | None, observed_date: str | None) -> str:
+    if value is None or not observed_date or observed_date == DATA_MISSING:
+        return DATA_MISSING
+    return f"{_fmt_number(value)} ({_compact_iso(observed_date)})"
+
+
+def _latest_point_asof(points: list[tuple[date, float]], ref_date: date) -> tuple[float | None, str]:
+    chosen: tuple[date, float] | None = None
+    for point_date, point_value in points:
+        if point_date <= ref_date:
+            chosen = (point_date, point_value)
+        else:
+            break
+    if chosen is None:
+        return None, DATA_MISSING
+    point_date, point_value = chosen
+    return point_value, point_date.isoformat()
 
 
 def _contains_korean(text: str) -> bool:
@@ -550,6 +602,57 @@ class ApiClient:
         params = {"interval": interval, "range": range_}
         return self.get_json(f"{YAHOO_CHART_BASE_URL}/{symbol}?{urlencode(params)}")
 
+    def yahoo_quote_summary(self, symbol: str | None, modules: tuple[str, ...] = ("defaultKeyStatistics", "financialData", "summaryDetail")) -> dict[str, Any] | None:
+        if not symbol:
+            return None
+        params = {"modules": ",".join(modules)}
+        payload = self.get_json(f"{YAHOO_QUOTE_SUMMARY_URL}/{symbol}?{urlencode(params)}")
+        if not payload:
+            return None
+        result = ((payload.get("quoteSummary") or {}).get("result") or [None])[0]
+        return result if isinstance(result, dict) else None
+
+    def fnguide_consensus(self, stock_code: str | None) -> dict[str, Any] | None:
+        code = str(stock_code or "").strip()
+        if not code:
+            return None
+        params = {
+            "pGB": "1",
+            "gicode": f"A{code}",
+            "cID": "",
+            "MenuYn": "Y",
+            "ReportGB": "",
+            "NewMenuID": "101",
+            "stkGb": "701",
+        }
+        request = Request(
+            f"{FNGUIDE_MAIN_URL}?{urlencode(params)}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                html = response.read().decode("utf-8", "ignore")
+        except (HTTPError, URLError, TimeoutError, OSError):
+            return None
+        date_match = re.search(r'<h2>투자의견 컨센서스</h2>\s*<span class="date">\[(.*?)\]</span>', html, re.S)
+        row_match = re.search(
+            r'<div class="um_table" id="svdMainGrid9">.*?<tbody>\s*<tr[^>]*>\s*'
+            r'<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>',
+            html,
+            re.S,
+        )
+        if not row_match:
+            return None
+        cells = [re.sub(r"<.*?>", "", value).replace("&nbsp;", " ").strip() for value in row_match.groups()]
+        return {
+            "date": date_match.group(1).strip() if date_match else DATA_MISSING,
+            "opinion_score": cells[0] or DATA_MISSING,
+            "target_price": cells[1] or DATA_MISSING,
+            "eps": cells[2] or DATA_MISSING,
+            "per": cells[3] or DATA_MISSING,
+            "analyst_count": cells[4] or DATA_MISSING,
+        }
+
     def krx_query(self, path: str, **params: str) -> dict[str, Any] | None:
         if not self.krx_key:
             return None
@@ -787,9 +890,10 @@ class ReportDataBuilder:
         sectors = self._build_sector_data(target_date)
         disclosures = self._build_disclosures(target_date)
         hyundai = self._build_hyundai_data(target_date, disclosures)
-        favorites = self._build_favorite_stocks(hyundai, sectors, disclosures)
+        favorites = self._build_favorite_stocks(target_date, hyundai, sectors, disclosures)
         session_data = self._build_session_data(session, common, hyundai, sectors, disclosures)
         return {
+            "session_name": session,
             "session": session_data,
             "common": common,
             "hyundai": hyundai,
@@ -802,7 +906,7 @@ class ReportDataBuilder:
 
     def _build_common_data(self, target_date: date) -> dict[str, dict[str, str]]:
         fred = self._build_fred_snapshot(target_date)
-        gold = self._build_gold_snapshot()
+        gold = self._build_gold_snapshot(target_date)
         krx_market = self._build_krx_market_data(target_date)
         kis_market = self._build_kis_market_data()
         return {
@@ -819,6 +923,7 @@ class ReportDataBuilder:
             "fx_commodities": {
                 "usdkrw": fred["usdkrw"]["text"],
                 "gold": gold["text"],
+                "gold_snapshot": gold,
                 "analysis": self._fx_gold_analysis(fred["usdkrw"], gold),
             },
             "korea_market": {
@@ -846,32 +951,61 @@ class ReportDataBuilder:
 
     def _build_fred_snapshot(self, target_date: date) -> dict[str, dict[str, str | float | None]]:
         output: dict[str, dict[str, str | float | None]] = {}
+        month_ago = _shift_months(target_date, -1)
+        week_ago = target_date - timedelta(days=7)
+        yesterday = target_date - timedelta(days=1)
         for key, series_id in self.fred_series.items():
             observations = self.client.fred_observations(series_id, target_date)
             latest = _latest_valid_observations(observations, 2)
             latest_val = _safe_float(latest[-1]["value"]) if latest else None
             prev_val = _safe_float(latest[-2]["value"]) if len(latest) > 1 else None
             delta = (latest_val - prev_val) if latest_val is not None and prev_val is not None else None
+            points: list[tuple[date, float]] = []
+            for obs in observations:
+                value = _safe_float(obs.get("value"))
+                obs_date_raw = obs.get("date")
+                if value is None or not obs_date_raw or obs_date_raw == DATA_MISSING:
+                    continue
+                try:
+                    obs_date = date.fromisoformat(obs_date_raw)
+                except ValueError:
+                    continue
+                points.append((obs_date, value))
+            month_val, month_date = _latest_point_asof(points, month_ago)
+            week_val, week_date = _latest_point_asof(points, week_ago)
+            day_val, day_date = _latest_point_asof(points, yesterday)
             output[key] = {
                 "value": latest_val,
                 "prev_value": prev_val,
                 "delta": delta,
                 "date": latest[-1]["date"] if latest else DATA_MISSING,
                 "text": f"{_fmt_number(latest_val)} ({_compact_iso(latest[-1]['date'])})" if latest_val is not None and latest else DATA_MISSING,
+                "month_ago_value": month_val,
+                "month_ago_date": month_date,
+                "month_ago_text": _snapshot_text(month_val, month_date),
+                "week_ago_value": week_val,
+                "week_ago_date": week_date,
+                "week_ago_text": _snapshot_text(week_val, week_date),
+                "yesterday_value": day_val,
+                "yesterday_date": day_date,
+                "yesterday_text": _snapshot_text(day_val, day_date),
             }
         return output
 
-    def _build_gold_snapshot(self) -> dict[str, str | float | None]:
-        payload = self.client.yahoo_chart("GC=F", interval="1d", range_="1mo") or {}
+    def _build_gold_snapshot(self, target_date: date) -> dict[str, str | float | None]:
+        payload = self.client.yahoo_chart("GC=F", interval="1d", range_="3mo") or {}
         result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
         timestamps = result.get("timestamp") or []
         quote = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
         closes = quote.get("close") or []
-        points: list[tuple[int, float]] = []
+        points: list[tuple[date, float]] = []
         for timestamp, close in zip(timestamps, closes):
             if close in (None, ""):
                 continue
-            points.append((timestamp, float(close)))
+            point_date = datetime.utcfromtimestamp(timestamp).date()
+            if point_date > target_date:
+                continue
+            points.append((point_date, float(close)))
         if not points:
             return {
                 "value": None,
@@ -879,17 +1013,41 @@ class ReportDataBuilder:
                 "delta": None,
                 "date": DATA_MISSING,
                 "text": DATA_MISSING,
+                "month_ago_value": None,
+                "month_ago_date": DATA_MISSING,
+                "month_ago_text": DATA_MISSING,
+                "week_ago_value": None,
+                "week_ago_date": DATA_MISSING,
+                "week_ago_text": DATA_MISSING,
+                "yesterday_value": None,
+                "yesterday_date": DATA_MISSING,
+                "yesterday_text": DATA_MISSING,
             }
-        latest_ts, latest_value = points[-1]
+        latest_date_obj, latest_value = points[-1]
         prev_value = points[-2][1] if len(points) > 1 else None
         delta = latest_value - prev_value if prev_value is not None else None
-        latest_date = datetime.utcfromtimestamp(latest_ts).strftime("%Y-%m-%d")
+        latest_date = latest_date_obj.isoformat()
+        month_ago = _shift_months(target_date, -1)
+        week_ago = target_date - timedelta(days=7)
+        yesterday = target_date - timedelta(days=1)
+        month_val, month_date = _latest_point_asof(points, month_ago)
+        week_val, week_date = _latest_point_asof(points, week_ago)
+        day_val, day_date = _latest_point_asof(points, yesterday)
         return {
             "value": latest_value,
             "prev_value": prev_value,
             "delta": delta,
             "date": latest_date,
             "text": f"{_fmt_number(latest_value)} ({latest_date})",
+            "month_ago_value": month_val,
+            "month_ago_date": month_date,
+            "month_ago_text": _snapshot_text(month_val, month_date),
+            "week_ago_value": week_val,
+            "week_ago_date": week_date,
+            "week_ago_text": _snapshot_text(week_val, week_date),
+            "yesterday_value": day_val,
+            "yesterday_date": day_date,
+            "yesterday_text": _snapshot_text(day_val, day_date),
         }
 
     def _build_krx_market_data(self, target_date: date) -> dict[str, str]:
@@ -963,7 +1121,7 @@ class ReportDataBuilder:
             "investor_flow_reason": "investor_flow_path 미설정 또는 응답 파싱 로직 미구현" if not flow_payload else "응답 파싱 로직 미구현",
         }
 
-    def _hyundai_financial_report_candidates(self, target_date: date) -> list[tuple[int, str, str]]:
+    def _dart_financial_report_candidates(self, target_date: date) -> list[tuple[int, str, str]]:
         year = target_date.year
         month = target_date.month
         if month >= 11:
@@ -1005,9 +1163,9 @@ class ReportDataBuilder:
                     return amount
         return None
 
-    def _build_hyundai_dart_financial_snapshot(self, target_date: date) -> DartFinancialSnapshot | None:
-        corp_name = "현대자동차"
-        for bsns_year, reprt_code, report_name in self._hyundai_financial_report_candidates(target_date):
+    def _build_company_dart_financial_snapshot(self, company: dict[str, Any], target_date: date) -> DartFinancialSnapshot | None:
+        corp_name = company.get("dart_name") or company["name"]
+        for bsns_year, reprt_code, report_name in self._dart_financial_report_candidates(target_date):
             rows = self.client.dart_single_account(corp_name, bsns_year, reprt_code)
             if not rows:
                 continue
@@ -1023,20 +1181,20 @@ class ReportDataBuilder:
             )
         return None
 
-    def _hyundai_capital_policy_summary(self, disclosures: list[DisclosureItem]) -> tuple[str, str]:
+    def _capital_policy_summary(self, company_name: str, disclosures: list[DisclosureItem]) -> tuple[str, str]:
         keywords = ("자기주식", "유상증자", "무상증자", "유무상증자", "감자", "전환사채", "신주인수권부사채", "교환사채", "배당")
         matched = [item for item in disclosures if any(keyword in item.report_name for keyword in keywords)]
         if not matched:
             return (
-                "최근 90일 내 자사주·증자·사채·감자 관련 현대차 공시 미수집",
-                "자본정책 새 이벤트가 없으면 주주환원 확대보다 기존 정책 유지로 해석",
+                f"최근 90일 내 자사주·증자·사채·감자 관련 {company_name} 공시 미수집",
+                "자본정책 새 이벤트가 없으면 기존 정책 유지로 해석",
             )
         top = matched[:3]
         summary = " | ".join(f"{item.report_name} ({item.filed_at})" for item in top)
         view = "자기주식·증자·사채 관련 공시는 주주환원 또는 자금조달 신호이므로 headline보다 조건을 확인해야 한다."
         return summary, view
 
-    def _hyundai_event_summary(self, disclosures: list[DisclosureItem]) -> tuple[str, str]:
+    def _event_summary(self, company_name: str, disclosures: list[DisclosureItem]) -> tuple[str, str]:
         keywords = (
             "기업설명회", "실적", "분기보고서", "반기보고서", "사업보고서", "주주총회",
             "합병", "분할", "영업양수", "영업양도", "유형자산", "타법인 주식", "해외 증권시장",
@@ -1044,7 +1202,7 @@ class ReportDataBuilder:
         matched = [item for item in disclosures if any(keyword in item.report_name for keyword in keywords)]
         if not matched:
             return (
-                "최근 90일 내 현대차 이벤트성 공시 미수집",
+                f"최근 90일 내 {company_name} 이벤트성 공시 미수집",
                 "이벤트 공시가 비어 있으면 단기 주가 해석은 뉴스보다 업종 수급과 환율 영향이 더 크다.",
             )
         top = matched[:3]
@@ -1096,87 +1254,79 @@ class ReportDataBuilder:
 
     def _build_hyundai_data(self, target_date: date, disclosures: dict[str, Any]) -> dict[str, str]:
         company = next(item for item in self.tracked_companies if item["name"] == "현대차")
-        kis_hyundai = self._build_kis_hyundai_data()
-        krx_hyundai = self._build_krx_hyundai_data(target_date)
-        hyundai_disclosures = disclosures.get("items_by_company", {}).get("현대차", [])
-        dart_financial = self._build_hyundai_dart_financial_snapshot(target_date)
-        capital_policy_summary, capital_policy_view = self._hyundai_capital_policy_summary(hyundai_disclosures)
-        event_summary, event_view = self._hyundai_event_summary(hyundai_disclosures)
-        symbol = os.getenv("HYUNDAI_ALPHA_SYMBOL") or company.get("alpha_symbol") or self._resolve_alpha_symbol(company)
+        return self._build_favorite_stock_data(company, target_date, disclosures)
+
+    def _build_favorite_stock_data(self, company: dict[str, Any], target_date: date, disclosures: dict[str, Any]) -> dict[str, str]:
+        company_name = company["name"]
+        kis_data = self._build_kis_hyundai_data() if company_name == "현대차" else self._empty_stock_flow_data()
+        krx_data = self._build_krx_stock_data(company, target_date)
+        company_disclosures = disclosures.get("items_by_company", {}).get(company_name, [])
+        dart_financial = self._build_company_dart_financial_snapshot(company, target_date)
+        capital_policy_summary, capital_policy_view = self._capital_policy_summary(company_name, company_disclosures)
+        event_summary, event_view = self._event_summary(company_name, company_disclosures)
+        yahoo_symbol = self._yahoo_symbol_for_company(company)
+        yahoo_history = self.client.yahoo_chart(yahoo_symbol, interval="1d", range_="1y") or {}
+        yahoo_summary = self.client.yahoo_quote_summary(yahoo_symbol) or {}
+        symbol = (
+            os.getenv("HYUNDAI_ALPHA_SYMBOL") if company_name == "현대차" else None
+        ) or company.get("alpha_symbol") or yahoo_symbol or self._resolve_alpha_symbol(company)
         quote = self.client.alpha_query("GLOBAL_QUOTE", symbol=symbol) or {}
         daily = self.client.alpha_query("TIME_SERIES_DAILY", symbol=symbol, outputsize="full") or {}
         global_quote = quote.get("Global Quote", {})
-        series = daily.get("Time Series (Daily)", {})
-        rows = sorted(series.items(), reverse=True)
-        highs: list[float] = []
-        lows: list[float] = []
-        closes: list[float] = []
-        prev_close: float | None = None
-        latest_close: float | None = None
-        latest_high: float | None = None
-        latest_low: float | None = None
-        latest_volume: int | None = None
-        for index, (_, values) in enumerate(rows):
-            high = _safe_float(values.get("2. high"))
-            low = _safe_float(values.get("3. low"))
-            close = _safe_float(values.get("4. close"))
-            volume = _safe_float(values.get("5. volume"))
-            if high is not None:
-                highs.append(high)
-            if low is not None:
-                lows.append(low)
-            if close is not None:
-                closes.append(close)
-                if index == 0:
-                    latest_close = close
-                    latest_high = high
-                    latest_low = low
-                    latest_volume = int(volume) if volume is not None else None
-                if index == 1:
-                    prev_close = close
-        krx_close_num = _safe_float(krx_hyundai["current_close"].replace(",", "")) if krx_hyundai["current_close"] != DATA_MISSING else None
-        krx_prev_close_num = _safe_float(krx_hyundai["previous_close"].replace(",", "")) if krx_hyundai["previous_close"] != DATA_MISSING else None
-        krx_volume_num = _parse_int_like(krx_hyundai["volume"]) if krx_hyundai["volume"] != DATA_MISSING else None
-        krx_high_num: float | None = None
-        krx_low_num: float | None = None
-        if krx_hyundai["intraday_high_low"] != DATA_MISSING:
-            high_text, _, low_text = krx_hyundai["intraday_high_low"].partition("/")
-            krx_high_num = _safe_float(high_text.replace(",", "").strip())
-            krx_low_num = _safe_float(low_text.replace(",", "").strip())
-        current_price = krx_close_num or _safe_float(global_quote.get("05. price")) or latest_close
-        prev_close = krx_prev_close_num or prev_close
-        current_volume = krx_volume_num or (int(float(global_quote["06. volume"])) if global_quote.get("06. volume") else latest_volume)
-        intraday_high = krx_high_num or _safe_float(global_quote.get("03. high")) or latest_high
-        intraday_low = krx_low_num or _safe_float(global_quote.get("04. low")) or latest_low
+        alpha_series = daily.get("Time Series (Daily)", {})
+        rows = sorted(alpha_series.items(), reverse=True)
+        highs, lows, closes, prev_close, latest_close, latest_high, latest_low, latest_volume = self._extract_alpha_history(rows)
+        yahoo_points = self._extract_yahoo_history(yahoo_history)
+        if yahoo_points["highs"]:
+            highs = yahoo_points["highs"]
+        if yahoo_points["lows"]:
+            lows = yahoo_points["lows"]
+        if yahoo_points["closes"]:
+            closes = yahoo_points["closes"]
+            latest_close = yahoo_points["latest_close"] or latest_close
+            prev_close = yahoo_points["prev_close"] or prev_close
+            latest_high = yahoo_points["latest_high"] or latest_high
+            latest_low = yahoo_points["latest_low"] or latest_low
+            latest_volume = yahoo_points["latest_volume"] or latest_volume
+        current_price, prev_close, current_volume, intraday_high, intraday_low = self._merge_stock_price_inputs(
+            kis_data,
+            krx_data,
+            global_quote,
+            latest_close,
+            prev_close,
+            latest_volume,
+            latest_high,
+            latest_low,
+        )
         ma20 = _rolling_average(closes, 20)
         ma60 = _rolling_average(closes, 60)
-        return {
+        disclosure = self._latest_company_disclosure(company_name, disclosures)
+        data = {
+            "name": company_name,
             "symbol": symbol or DATA_MISSING,
-            "current_close": self._prefer_values(kis_hyundai["current_close"], krx_hyundai["current_close"], _fmt_number(current_price)),
-            "previous_close": self._prefer_values(kis_hyundai["previous_close"], krx_hyundai["previous_close"], _fmt_number(prev_close)),
-            "volume": self._prefer_values(kis_hyundai["volume"], krx_hyundai["volume"], _fmt_int(current_volume)),
+            "current_close": self._prefer_values(kis_data["current_close"], krx_data["current_close"], _fmt_number(current_price)),
+            "previous_close": self._prefer_values(kis_data["previous_close"], krx_data["previous_close"], _fmt_number(prev_close)),
+            "volume": self._prefer_values(kis_data["volume"], krx_data["volume"], _fmt_int(current_volume)),
             "week52_high": _fmt_number(max(highs[:252]) if highs else None),
             "week52_low": _fmt_number(min(lows[:252]) if lows else None),
-            "intraday_high_low": self._prefer_values(kis_hyundai["intraday_high_low"], krx_hyundai["intraday_high_low"], self._combine_values(intraday_high, intraday_low)),
-            "foreign_flow": kis_hyundai["foreign_flow"],
-            "institutional_flow": kis_hyundai["institutional_flow"],
-            "retail_flow": kis_hyundai["retail_flow"],
-            "short_selling": self._prefer_values(kis_hyundai["short_selling"], krx_hyundai["short_selling"]),
-            "forced_liquidation": kis_hyundai["forced_liquidation"],
+            "per": _fmt_ratio(self._yahoo_quote_metric(yahoo_summary, "trailingPE")),
+            "forward_per": _fmt_ratio(self._yahoo_quote_metric(yahoo_summary, "forwardPE")),
+            "intraday_high_low": self._prefer_values(kis_data["intraday_high_low"], krx_data["intraday_high_low"], self._combine_values(intraday_high, intraday_low)),
+            "foreign_flow": kis_data["foreign_flow"],
+            "institutional_flow": kis_data["institutional_flow"],
+            "retail_flow": kis_data["retail_flow"],
+            "short_selling": self._prefer_values(kis_data["short_selling"], krx_data["short_selling"]),
+            "forced_liquidation": kis_data["forced_liquidation"],
             "ma5": _fmt_number(_rolling_average(closes, 5)),
             "ma20": _fmt_number(ma20),
             "ma60": _fmt_number(ma60),
             "support": _fmt_number(min(lows[:20]) if len(lows) >= 20 else None),
             "resistance": _fmt_number(max(highs[:20]) if len(highs) >= 20 else None),
-            "today_analysis": self._hyundai_analysis(current_price, ma20, ma60),
-            "tomorrow_scenario": self._hyundai_scenario(current_price, ma20),
-            "add_rule": self._hyundai_add_rule(current_price, ma20),
-            "exit_rule": self._hyundai_exit_rule(current_price, ma20),
-            "chart_structure": self._favorite_chart_structure(current_price, ma20, ma60, "현대차"),
-            "shakeout_view": self._shakeout_view(current_price, ma20, ma60, "현대차"),
-            "down_reason": self._favorite_down_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
-            "up_reason": self._favorite_up_reason(current_price, ma20, ma60, DATA_MISSING, "현대차"),
-            "forecast": self._favorite_forecast(current_price, ma20, ma60, "현대차"),
+            "chart_structure": self._favorite_chart_structure(current_price, ma20, ma60, company_name),
+            "shakeout_view": self._shakeout_view(current_price, ma20, ma60, company_name),
+            "down_reason": self._favorite_down_reason(current_price, ma20, ma60, disclosure, company_name),
+            "up_reason": self._favorite_up_reason(current_price, ma20, ma60, disclosure, company_name),
+            "forecast": self._favorite_forecast(current_price, ma20, ma60, company_name),
             "dart_financial_period": f"{dart_financial.bsns_year} {dart_financial.report_name}" if dart_financial else DATA_MISSING,
             "dart_financial_summary": (
                 f"매출 {_fmt_krw_compact(dart_financial.revenue)} | 영업이익 {_fmt_krw_compact(dart_financial.operating_income)} | "
@@ -1193,11 +1343,14 @@ class ReportDataBuilder:
             "dart_events": event_summary,
             "dart_events_view": event_view,
         }
+        data.update(self._stock_target_snapshot(company_name, current_price))
+        data.update(self._favorite_company_overrides(company_name, current_price, ma20, ma60, disclosures))
+        return data
 
-    def _build_krx_hyundai_data(self, target_date: date) -> dict[str, str]:
-        company = next(item for item in self.tracked_companies if item["name"] == "현대차")
+    def _build_krx_stock_data(self, company: dict[str, Any], target_date: date) -> dict[str, str]:
         stock_code = str(company.get("stock_code") or "").strip()
         market = str(company.get("market") or "KOSPI").upper()
+        company_name = company["name"]
         if not self.client.krx_key or not stock_code:
             return {
                 "current_close": DATA_MISSING,
@@ -1212,7 +1365,7 @@ class ReportDataBuilder:
             rows = self.client.krx_stock_daily(daily_path, query_date, stock_code)
             if not rows:
                 continue
-            row = self._select_krx_stock_row(rows, stock_code, "현대차")
+            row = self._select_krx_stock_row(rows, stock_code, company_name)
             if not row:
                 continue
             close_value = self._fmt_krx_number(self._krx_row_value(row, "TDD_CLSPRC", "CLSPRC", "CLSPRC_IDX"))
@@ -1239,47 +1392,311 @@ class ReportDataBuilder:
 
     def _build_favorite_stocks(
         self,
+        target_date: date,
         hyundai: dict[str, str],
         sectors: dict[str, dict[str, str]],
         disclosures: dict[str, Any],
     ) -> dict[str, dict[str, str]]:
-        dnd = self._build_dnd_favorite_data(sectors, disclosures)
+        favorites: dict[str, dict[str, str]] = {}
+        for company in self.tracked_companies:
+            if company["name"] == "현대차":
+                favorites[company["name"]] = hyundai
+                continue
+            favorites[company["name"]] = self._build_favorite_stock_data(company, target_date, disclosures)
+        return favorites
+
+    def _favorite_company_overrides(
+        self,
+        company_name: str,
+        current_price: float | None,
+        ma20: float | None,
+        ma60: float | None,
+        disclosures: dict[str, Any],
+    ) -> dict[str, str]:
+        if company_name == "현대차":
+            return {
+                "today_analysis": self._hyundai_analysis(current_price, ma20, ma60),
+                "tomorrow_scenario": self._hyundai_scenario(current_price, ma20),
+                "add_rule": self._hyundai_add_rule(current_price, ma20),
+                "exit_rule": self._hyundai_exit_rule(current_price, ma20),
+            }
+        if company_name == "디앤디파마텍":
+            bio = self._build_dnd_sector_context(disclosures)
+            disclosure = self._latest_company_disclosure(company_name, disclosures)
+            return {
+                "today_analysis": self._dnd_today_analysis(bio, disclosure),
+                "tomorrow_scenario": self._dnd_tomorrow_scenario(bio, disclosure),
+                "add_rule": self._dnd_add_rule(disclosure),
+                "exit_rule": self._dnd_exit_rule(disclosure),
+            }
         return {
-            "hyundai": hyundai,
-            "dnd": dnd,
+            "today_analysis": self._favorite_forecast(current_price, ma20, ma60, company_name),
+            "tomorrow_scenario": self._favorite_forecast(current_price, ma20, ma60, company_name),
+            "add_rule": self._favorite_add_rule(current_price, ma20, company_name),
+            "exit_rule": self._favorite_exit_rule(current_price, ma20, company_name),
         }
 
-    def _build_dnd_favorite_data(self, sectors: dict[str, dict[str, str]], disclosures: dict[str, Any]) -> dict[str, str]:
-        bio = sectors.get("바이오/헬스케어", {})
+    def _build_dnd_sector_context(self, disclosures: dict[str, Any]) -> dict[str, str]:
         disclosure = self._latest_company_disclosure("디앤디파마텍", disclosures)
         return {
-            "symbol": DATA_MISSING,
+            "headline": DATA_MISSING,
+            "clinical_news": DATA_MISSING,
+            "fda_news": DATA_MISSING,
+            "licensing_news": DATA_MISSING,
+            "dnd_comment": disclosure,
+        }
+
+    def _empty_stock_flow_data(self) -> dict[str, str]:
+        return {
             "current_close": DATA_MISSING,
             "previous_close": DATA_MISSING,
             "volume": DATA_MISSING,
-            "week52_high": DATA_MISSING,
-            "week52_low": DATA_MISSING,
             "intraday_high_low": DATA_MISSING,
             "foreign_flow": DATA_MISSING,
             "institutional_flow": DATA_MISSING,
             "retail_flow": DATA_MISSING,
             "short_selling": DATA_MISSING,
             "forced_liquidation": DATA_MISSING,
-            "ma5": DATA_MISSING,
-            "ma20": DATA_MISSING,
-            "ma60": DATA_MISSING,
-            "support": DATA_MISSING,
-            "resistance": DATA_MISSING,
-            "today_analysis": self._dnd_today_analysis(bio, disclosure),
-            "tomorrow_scenario": self._dnd_tomorrow_scenario(bio, disclosure),
-            "add_rule": self._dnd_add_rule(disclosure),
-            "exit_rule": self._dnd_exit_rule(disclosure),
-            "chart_structure": "차트 데이터 미수집 (국내 개별 종목 시세 API 미연동). 현재는 바이오 섹터 뉴스와 공시가 가격 방향의 선행 단서다.",
-            "shakeout_view": "개미 털기 여부는 데이터 미수집 (분봉/체결강도/호가 데이터 미연동). 단기 급등 이후 거래량 없는 눌림이면 털기보다 관심 이탈 가능성 쪽을 우선 점검.",
-            "down_reason": self._favorite_down_reason(None, None, None, disclosure, "디앤디파마텍"),
-            "up_reason": self._favorite_up_reason(None, None, None, disclosure, "디앤디파마텍"),
-            "forecast": self._favorite_forecast(None, None, None, "디앤디파마텍"),
         }
+
+    def _extract_alpha_history(
+        self,
+        rows: list[tuple[str, dict[str, str]]],
+    ) -> tuple[list[float], list[float], list[float], float | None, float | None, float | None, float | None, int | None]:
+        highs: list[float] = []
+        lows: list[float] = []
+        closes: list[float] = []
+        prev_close: float | None = None
+        latest_close: float | None = None
+        latest_high: float | None = None
+        latest_low: float | None = None
+        latest_volume: int | None = None
+        for index, (_, values) in enumerate(rows):
+            high = _safe_float(values.get("2. high"))
+            low = _safe_float(values.get("3. low"))
+            close = _safe_float(values.get("4. close"))
+            volume = _safe_float(values.get("5. volume"))
+            if high is not None:
+                highs.append(high)
+            if low is not None:
+                lows.append(low)
+            if close is not None:
+                closes.append(close)
+                if index == 0:
+                    latest_close = close
+                    latest_high = high
+                    latest_low = low
+                    latest_volume = int(volume) if volume is not None else None
+                if index == 1:
+                    prev_close = close
+        return highs, lows, closes, prev_close, latest_close, latest_high, latest_low, latest_volume
+
+    def _extract_yahoo_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = ((payload.get("chart") or {}).get("result") or [None])[0] or {}
+        quote = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
+        highs_raw = quote.get("high") or []
+        lows_raw = quote.get("low") or []
+        closes_raw = quote.get("close") or []
+        volumes_raw = quote.get("volume") or []
+        highs = [float(value) for value in highs_raw if value not in (None, "")]
+        lows = [float(value) for value in lows_raw if value not in (None, "")]
+        closes = [float(value) for value in closes_raw if value not in (None, "")]
+        volume_points = [int(value) for value in volumes_raw if value not in (None, "")]
+        return {
+            "highs": list(reversed(highs)),
+            "lows": list(reversed(lows)),
+            "closes": list(reversed(closes)),
+            "latest_close": closes[-1] if closes else None,
+            "prev_close": closes[-2] if len(closes) > 1 else None,
+            "latest_high": highs[-1] if highs else None,
+            "latest_low": lows[-1] if lows else None,
+            "latest_volume": volume_points[-1] if volume_points else None,
+        }
+
+    def _merge_stock_price_inputs(
+        self,
+        kis_data: dict[str, str],
+        krx_data: dict[str, str],
+        global_quote: dict[str, str],
+        latest_close: float | None,
+        prev_close: float | None,
+        latest_volume: int | None,
+        latest_high: float | None,
+        latest_low: float | None,
+    ) -> tuple[float | None, float | None, int | None, float | None, float | None]:
+        krx_close_num = _safe_float(krx_data["current_close"].replace(",", "")) if krx_data["current_close"] != DATA_MISSING else None
+        krx_prev_close_num = _safe_float(krx_data["previous_close"].replace(",", "")) if krx_data["previous_close"] != DATA_MISSING else None
+        krx_volume_num = _parse_int_like(krx_data["volume"]) if krx_data["volume"] != DATA_MISSING else None
+        krx_high_num: float | None = None
+        krx_low_num: float | None = None
+        if krx_data["intraday_high_low"] != DATA_MISSING:
+            high_text, _, low_text = krx_data["intraday_high_low"].partition("/")
+            krx_high_num = _safe_float(high_text.replace(",", "").strip())
+            krx_low_num = _safe_float(low_text.replace(",", "").strip())
+        current_price = krx_close_num or _safe_float(global_quote.get("05. price")) or latest_close
+        prev_close = krx_prev_close_num or prev_close
+        current_volume = krx_volume_num or (int(float(global_quote["06. volume"])) if global_quote.get("06. volume") else latest_volume)
+        intraday_high = krx_high_num or _safe_float(global_quote.get("03. high")) or latest_high
+        intraday_low = krx_low_num or _safe_float(global_quote.get("04. low")) or latest_low
+        return current_price, prev_close, current_volume, intraday_high, intraday_low
+
+    def _yahoo_symbol_for_company(self, company: dict[str, Any]) -> str | None:
+        stock_code = str(company.get("stock_code") or "").strip()
+        market = str(company.get("market") or "").upper()
+        if not stock_code or market not in {"KOSPI", "KOSDAQ"}:
+            return None
+        suffix = ".KS" if market == "KOSPI" else ".KQ"
+        return f"{stock_code}{suffix}"
+
+    def _yahoo_quote_metric(self, payload: dict[str, Any], field: str) -> float | None:
+        for section_name in ("defaultKeyStatistics", "financialData", "summaryDetail"):
+            section = payload.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            value = section.get(field)
+            if isinstance(value, dict):
+                raw = value.get("raw")
+                if isinstance(raw, (int, float)):
+                    return float(raw)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    def _yahoo_quote_text(self, payload: dict[str, Any], field: str) -> str | None:
+        for section_name in ("financialData", "defaultKeyStatistics", "summaryDetail"):
+            section = payload.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            value = section.get(field)
+            if isinstance(value, dict):
+                fmt = value.get("fmt")
+                raw = value.get("raw")
+                if isinstance(fmt, str) and fmt.strip():
+                    return fmt.strip()
+                if isinstance(raw, str) and raw.strip():
+                    return raw.strip()
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _company_reference(self, name: str) -> dict[str, Any]:
+        for company in self.tracked_companies:
+            if company.get("name") == name:
+                return company
+        return {"name": name, **EXTRA_COMPANY_METADATA.get(name, {})}
+
+    def _stock_target_snapshot(self, name: str, current_price: float | None = None) -> dict[str, str]:
+        company = self._company_reference(name)
+        fnguide = self.client.fnguide_consensus(company.get("stock_code"))
+        yahoo_symbol = self._yahoo_symbol_for_company(company)
+        yahoo_summary = (self.client.yahoo_quote_summary(yahoo_symbol) or {}) if yahoo_symbol else {}
+        if current_price is None and yahoo_symbol:
+            yahoo_chart = self.client.yahoo_chart(yahoo_symbol, interval="1d", range_="5d") or {}
+            yahoo_points = self._extract_yahoo_history(yahoo_chart)
+            current_price = yahoo_points.get("latest_close") or current_price
+        target_mean = self._yahoo_quote_metric(yahoo_summary, "targetMeanPrice")
+        target_high = self._yahoo_quote_metric(yahoo_summary, "targetHighPrice")
+        target_low = self._yahoo_quote_metric(yahoo_summary, "targetLowPrice")
+        target_median = self._yahoo_quote_metric(yahoo_summary, "targetMedianPrice")
+        analyst_count = self._yahoo_quote_metric(yahoo_summary, "numberOfAnalystOpinions")
+        recommendation = self._yahoo_quote_text(yahoo_summary, "recommendationKey")
+        if target_mean is None and fnguide and fnguide.get("target_price") not in (None, "", DATA_MISSING):
+            target_mean = _safe_float(str(fnguide.get("target_price")).replace(",", ""))
+        if analyst_count is None and fnguide and fnguide.get("analyst_count") not in (None, "", DATA_MISSING):
+            analyst_count = _safe_float(str(fnguide.get("analyst_count")).replace(",", ""))
+        if not recommendation and fnguide and fnguide.get("opinion_score") not in (None, "", DATA_MISSING):
+            recommendation = f"score {fnguide['opinion_score']}"
+        target_text = self._target_price_text(target_mean, target_median, target_high, target_low, analyst_count, recommendation)
+        target_view = self._target_price_view(name, current_price, target_mean, target_high, target_low)
+        target_basis = self._target_price_basis(analyst_count, recommendation, target_high, target_low, fnguide)
+        return {
+            "target_price": target_text,
+            "target_price_view": target_view,
+            "target_price_basis": target_basis,
+        }
+
+    def _target_price_text(
+        self,
+        target_mean: float | None,
+        target_median: float | None,
+        target_high: float | None,
+        target_low: float | None,
+        analyst_count: float | None,
+        recommendation: str | None,
+    ) -> str:
+        if target_mean is None and target_median is None and target_high is None and target_low is None:
+            return DATA_MISSING
+        parts: list[str] = []
+        if target_mean is not None:
+            parts.append(f"평균 {_fmt_number(target_mean, 0)}")
+        if target_median is not None:
+            parts.append(f"중앙값 {_fmt_number(target_median, 0)}")
+        if target_high is not None and target_low is not None:
+            parts.append(f"범위 {_fmt_number(target_low, 0)}~{_fmt_number(target_high, 0)}")
+        elif target_high is not None:
+            parts.append(f"상단 {_fmt_number(target_high, 0)}")
+        elif target_low is not None:
+            parts.append(f"하단 {_fmt_number(target_low, 0)}")
+        if analyst_count is not None:
+            parts.append(f"커버리지 {int(analyst_count)}명")
+        if recommendation:
+            parts.append(f"컨센서스 {recommendation}")
+        return " | ".join(parts) if parts else DATA_MISSING
+
+    def _target_price_view(
+        self,
+        name: str,
+        current_price: float | None,
+        target_mean: float | None,
+        target_high: float | None,
+        target_low: float | None,
+    ) -> str:
+        if target_mean is None:
+            return f"{name} 목표주가 해석은 데이터 미수집 (애널리스트 평균 목표가 미제공)"
+        if current_price is None or current_price <= 0:
+            return f"{name} 목표주가는 평균 {_fmt_number(target_mean, 0)} 수준으로 보이지만 현재가 비교 데이터가 없어 괴리 해석은 보류한다."
+        gap_pct = ((target_mean - current_price) / current_price) * 100
+        gap_text = _fmt_pct(gap_pct)
+        if gap_pct >= 15:
+            stance = "현재가 대비 의미 있는 상방여력이 반영된 상태다"
+        elif gap_pct >= 5:
+            stance = "현재가 대비 완만한 상방여력을 반영한 중립 이상 시각이다"
+        elif gap_pct > -5:
+            stance = "현재가와 목표주가 괴리가 크지 않아 대체로 적정가 근처 시각에 가깝다"
+        else:
+            stance = "현재가가 컨센서스 목표에 근접했거나 일부 구간에서는 선반영됐다고 볼 수 있다"
+        range_note = ""
+        if target_high is not None and target_low is not None and current_price > 0:
+            spread_pct = ((target_high - target_low) / current_price) * 100
+            range_note = f" 목표가 밴드도 약 {_fmt_pct(spread_pct)} 폭이라 의견 분산을 함께 봐야 한다."
+        return f"{name} 평균 목표주가는 현재가 대비 {gap_text} 괴리다. 즉 {stance}.{range_note}"
+
+    def _target_price_basis(
+        self,
+        analyst_count: float | None,
+        recommendation: str | None,
+        target_high: float | None,
+        target_low: float | None,
+        fnguide: dict[str, Any] | None = None,
+    ) -> str:
+        if analyst_count is None and recommendation is None and target_high is None and target_low is None and not fnguide:
+            return "목표주가 근거 미수집"
+        parts: list[str] = []
+        if analyst_count is not None:
+            parts.append(f"애널리스트 {int(analyst_count)}명 컨센서스 기준")
+        if recommendation:
+            parts.append(f"추천 키워드 {recommendation}")
+        if target_high is not None and target_low is not None:
+            parts.append(f"상단/하단 목표가 차이가 {_fmt_number(target_high - target_low, 0)} 수준이라 전망 분산도 확인 필요")
+        if fnguide:
+            fg_date = fnguide.get("date", DATA_MISSING)
+            fg_eps = fnguide.get("eps", DATA_MISSING)
+            fg_per = fnguide.get("per", DATA_MISSING)
+            if fg_date != DATA_MISSING:
+                parts.append(f"FnGuide 컨센서스 기준일 {fg_date}")
+            if fg_eps != DATA_MISSING and fg_per != DATA_MISSING:
+                parts.append(f"FY1 기준 EPS {fg_eps} / PER {fg_per}")
+        return " | ".join(parts) if parts else "목표주가 근거 미수집"
 
     def _resolve_alpha_symbol(self, company: dict[str, Any]) -> str | None:
         for keyword in company.get("alpha_search_keywords", []):
@@ -1588,6 +2005,7 @@ class ReportDataBuilder:
         sectors: dict[str, dict[str, str]],
         disclosures: dict[str, Any],
     ) -> dict[str, str]:
+        stock_frame = self._individual_stock_frame(common, sectors, disclosures)
         if session == "morning":
             evidence_score = self._evidence_score(common, hyundai, sectors, disclosures)
             no_trade = self._no_trade_condition(common, hyundai)
@@ -1597,12 +2015,16 @@ class ReportDataBuilder:
             return {
                 "market_score": str(market_score) if market_score is not None else DATA_MISSING,
                 "stance": stance,
+                "stance_reason": self._stance_reason(common, stance),
                 "top_news_3": top_news,
-                "global_major_issues": self._global_major_issues(common, disclosures),
+                "overseas_major_news": self._overseas_major_news(sectors),
+                "overseas_major_news_view": self._overseas_major_news_view(sectors),
                 "industry_major_issues": self._industry_major_issues(sectors),
+                "industry_major_issues_view": self._industry_major_issues_view(sectors),
                 "capital_flow_now": self._capital_flow_now(common, sectors),
                 "us_sector_focus": self._us_sector_focus(sectors),
                 "expected_sector_today": self._expected_sector_today(common, sectors),
+                "expected_sector_reason": self._expected_sector_reason(common, sectors),
                 "market_tradeability": self._market_tradeability(stance, evidence_score),
                 "market_bias": self._market_bias(common, stance),
                 "market_risk_guard": self._market_risk_guard(common, hyundai),
@@ -1619,8 +2041,8 @@ class ReportDataBuilder:
                 "entry_candidates": self._entry_candidates(hyundai, sectors),
                 "watch_candidates": "현대차, 삼성전자, 디앤디파마텍",
                 "risk_rules": self._dont_do_action(stance),
-                "recent_disclosures": disclosures["recent"],
-                "disclosure_summary": disclosures["summary"],
+                "recent_disclosures": self._sector_stock_recent_disclosures(stock_frame, disclosures),
+                "disclosure_summary": self._sector_stock_disclosure_summary(stock_frame, disclosures),
                 "evidence_score": evidence_score,
                 "evidence_comment": self._evidence_comment(evidence_score),
                 "no_trade_condition": no_trade,
@@ -1628,7 +2050,7 @@ class ReportDataBuilder:
                 "entry_trigger": self._entry_trigger(common, hyundai),
                 "invalidation": self._invalidation_rule(common, hyundai),
                 "opposite_signal": self._opposite_signal(common, hyundai, sectors),
-                **self._individual_stock_frame(common, sectors, disclosures),
+                **stock_frame,
             }
         if session == "afternoon":
             evidence_score = self._evidence_score(common, hyundai, sectors, disclosures)
@@ -1656,9 +2078,9 @@ class ReportDataBuilder:
                 "entry_trigger": self._entry_trigger(common, hyundai),
                 "invalidation": self._invalidation_rule(common, hyundai),
                 "opposite_signal": self._opposite_signal(common, hyundai, sectors),
-                "recent_disclosures": disclosures["recent"],
-                "disclosure_summary": disclosures["summary"],
-                **self._individual_stock_frame(common, sectors, disclosures),
+                "recent_disclosures": self._sector_stock_recent_disclosures(stock_frame, disclosures),
+                "disclosure_summary": self._sector_stock_disclosure_summary(stock_frame, disclosures),
+                **stock_frame,
             }
         stance = self._stance_from_score(self._market_score(common))
         evidence_score = self._evidence_score(common, hyundai, sectors, disclosures)
@@ -1686,9 +2108,9 @@ class ReportDataBuilder:
             "entry_trigger": self._entry_trigger(common, hyundai),
             "invalidation": self._invalidation_rule(common, hyundai),
             "opposite_signal": self._opposite_signal(common, hyundai, sectors),
-            "recent_disclosures": disclosures["recent"],
-            "disclosure_summary": disclosures["summary"],
-            **self._individual_stock_frame(common, sectors, disclosures),
+            "recent_disclosures": self._sector_stock_recent_disclosures(stock_frame, disclosures),
+            "disclosure_summary": self._sector_stock_disclosure_summary(stock_frame, disclosures),
+            **stock_frame,
         }
 
     def _build_closing_data(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> dict[str, str]:
@@ -1703,6 +2125,19 @@ class ReportDataBuilder:
             "flat_order": self._etf_core_scenario(sectors),
             "downside_order": hyundai["exit_rule"],
             "dont_do": self._dont_do_action(stance),
+            "market_day_summary": self._closing_market_day_summary(common, hyundai),
+            "market_move_reason": self._closing_market_move_reason(common, sectors, hyundai),
+            "market_problem": self._closing_market_problem(common, sectors, hyundai),
+            "market_sentiment_view": self._closing_market_sentiment_view(common, hyundai, sectors),
+            "hyundai_day_view": self._closing_hyundai_day_view(hyundai),
+            "tomorrow_outlook": self._closing_horizon_outlook("tomorrow", common, hyundai, sectors),
+            "next_week_outlook": self._closing_horizon_outlook("next_week", common, hyundai, sectors),
+            "one_month_outlook": self._closing_horizon_outlook("one_month", common, hyundai, sectors),
+            "six_month_outlook": self._closing_horizon_outlook("six_month", common, hyundai, sectors),
+            "bull_case": self._closing_bull_case(common, hyundai, sectors),
+            "bear_case": self._closing_bear_case(common, hyundai, sectors),
+            "invalidation_case": self._closing_invalidation_case(common, hyundai, sectors),
+            "must_watch": self._closing_must_watch(common, hyundai, sectors),
         }
 
     def _build_coverage(
@@ -1821,6 +2256,29 @@ class ReportDataBuilder:
             return ANALYSIS_PENDING
         return f"매크로 점수 기준 오늘 기본 태도는 {stance}."
 
+    def _stance_reason(self, common: dict[str, Any], stance: str) -> str:
+        if stance == DATA_MISSING:
+            return ANALYSIS_PENDING
+        fred = common.get("fred", {})
+        reasons: list[str] = []
+        us10y_delta = fred.get("us10y", {}).get("delta")
+        if us10y_delta is not None:
+            if us10y_delta > 0:
+                reasons.append("미국 10년물이 올라 성장주 밸류에이션 부담이 남아 있다")
+            else:
+                reasons.append("미국 10년물이 안정돼 금리 부담은 다소 완화됐다")
+        if fred.get("cpi", {}).get("value") is not None and fred.get("ppi", {}).get("value") is not None:
+            reasons.append("물가 둔화가 재확인되기 전까지는 공격적으로 확신하기 어렵다")
+        if fred.get("fed_funds", {}).get("value") is not None:
+            reasons.append("정책금리 고점 유지 여부가 아직 위험자산 방향을 완전히 열어주지 못하고 있다")
+        if not reasons:
+            return ANALYSIS_PENDING
+        if stance == "중립":
+            return "중립인 이유: " + " | ".join(reasons[:3])
+        if stance == "공격":
+            return "공격인 이유: " + " | ".join(reasons[:3])
+        return "방어인 이유: " + " | ".join(reasons[:3])
+
     def _rate_analysis(self, us10y: dict[str, Any]) -> str:
         delta = us10y["delta"]
         if delta is None:
@@ -1898,6 +2356,65 @@ class ReportDataBuilder:
             return " | ".join(issues[:5])
         return "세계 주요 이슈는 데이터 미수집 (FRED/DART 또는 해외 매크로 뉴스 데이터 부족)"
 
+    def _global_major_issues_view(self, common: dict[str, Any], disclosures: dict[str, Any]) -> str:
+        fred = common.get("fred", {})
+        notes: list[str] = []
+        us10y_delta = fred.get("us10y", {}).get("delta")
+        if us10y_delta is not None:
+            if us10y_delta > 0:
+                notes.append("미국 10년물 상승은 한국 성장주와 고밸류 종목에 할인율 부담으로 연결될 수 있다")
+            else:
+                notes.append("미국 10년물 안정/하락은 한국 대형 성장주와 반도체에 심리 완충재가 될 수 있다")
+        usdkrw_delta = fred.get("usdkrw", {}).get("delta")
+        if usdkrw_delta is not None:
+            if usdkrw_delta > 0:
+                notes.append("원/달러 상승은 외국인 현물 수급과 수입물가 부담 측면에서 한국장에 불리하다")
+            else:
+                notes.append("원/달러 하락은 외국인 위험선호 회복에 우호적이다")
+        gold_delta = common.get("fx_commodities", {}).get("gold_snapshot", {}).get("delta")
+        if gold_delta is not None:
+            if gold_delta > 0:
+                notes.append("금 가격 상승은 안전자산 선호가 남아 있다는 뜻이라 공격적 추격을 경계해야 한다")
+            else:
+                notes.append("금 가격 하락은 위험선호 회복 가능성을 같이 점검할 수 있다")
+        if disclosures.get("recent") != DATA_MISSING:
+            notes.append("최근 공시는 개별주 이벤트 리스크를 키울 수 있어 지수 판단과 별도로 봐야 한다")
+        if notes:
+            return " | ".join(notes[:3])
+        return ANALYSIS_PENDING
+
+    def _overseas_major_news(self, sectors: dict[str, dict[str, str]]) -> str:
+        items: list[tuple[str, str]] = []
+        for sector, data in sectors.items():
+            headline = data.get("headline_original", DATA_MISSING)
+            source = data.get("source", DATA_MISSING)
+            published = data.get("published_at", DATA_MISSING)
+            if headline == DATA_MISSING:
+                continue
+            items.append((published, f"{sector}: {headline} | {source} | {published}"))
+        if not items:
+            return "해외 주요 뉴스는 데이터 미수집 (섹터 뉴스 API 응답 부족 또는 관련 기사 필터링 실패)"
+        items.sort(key=lambda item: item[0], reverse=True)
+        return " || ".join(item[1] for item in items[:3])
+
+    def _overseas_major_news_view(self, sectors: dict[str, dict[str, str]]) -> str:
+        notes: list[str] = []
+        for sector in ("반도체", "AI", "자동차/현대차", "바이오/헬스케어", "로봇", "ETF: SCHD, QQQM, SPYG"):
+            data = sectors.get(sector, {})
+            headline = data.get("headline_original", DATA_MISSING)
+            description = data.get("headline_description", DATA_MISSING)
+            if headline == DATA_MISSING:
+                continue
+            if description != DATA_MISSING:
+                notes.append(f"{sector}: {description}")
+            else:
+                notes.append(f"{sector}: {headline}")
+            if len(notes) == 3:
+                break
+        if notes:
+            return " | ".join(notes)
+        return ANALYSIS_PENDING
+
     def _industry_major_issues(self, sectors: dict[str, dict[str, str]]) -> str:
         issues = []
         priority = ("반도체", "AI", "자동차/현대차", "바이오/헬스케어", "로봇", "ETF: SCHD, QQQM, SPYG")
@@ -1908,6 +2425,25 @@ class ReportDataBuilder:
         if issues:
             return " | ".join(issues[:3])
         return "산업 관련 이슈는 데이터 미수집 (섹터 뉴스 API 응답 부족 또는 관련 기사 필터링 실패)"
+
+    def _industry_major_issues_view(self, sectors: dict[str, dict[str, str]]) -> str:
+        notes: list[str] = []
+        priority = ("반도체", "AI", "자동차/현대차", "바이오/헬스케어", "로봇")
+        for sector in priority:
+            data = sectors.get(sector, {})
+            headline = data.get("headline", DATA_MISSING)
+            description = data.get("headline_description", DATA_MISSING)
+            if headline == DATA_MISSING:
+                continue
+            if description != DATA_MISSING:
+                notes.append(f"{sector}: {description}")
+            else:
+                notes.append(f"{sector}: headline은 확인됐지만 국내 가격 반응은 별도 확인 필요")
+            if len(notes) == 3:
+                break
+        if notes:
+            return " | ".join(notes)
+        return ANALYSIS_PENDING
 
     def _capital_flow_now(self, common: dict[str, Any], sectors: dict[str, dict[str, str]]) -> str:
         if common.get("flow", {}).get("foreign") != DATA_MISSING or common.get("flow", {}).get("institutional") != DATA_MISSING:
@@ -1944,6 +2480,21 @@ class ReportDataBuilder:
             return ", ".join(candidates[:3])
         return "오늘 예상 섹터는 데이터 미수집 (섹터별 체결강도·거래대금 비교 데이터 미연동)"
 
+    def _expected_sector_reason(self, common: dict[str, Any], sectors: dict[str, dict[str, str]]) -> str:
+        market_score = self._market_score(common)
+        reasons: list[str] = []
+        if sectors.get("반도체", {}).get("headline") != DATA_MISSING:
+            reasons.append("반도체는 관련 해외 뉴스가 있고 금리 안정 시 가장 먼저 반응하기 쉬운 축이다")
+        if sectors.get("AI", {}).get("headline") != DATA_MISSING and market_score is not None and market_score >= 3:
+            reasons.append("AI는 뉴스 흐름이 유지되고 매크로 점수가 중립 이상이라 심리 반등 후보가 된다")
+        if sectors.get("자동차/현대차", {}).get("headline") != DATA_MISSING:
+            reasons.append("자동차는 개별 이슈가 있더라도 환율과 업종 수급 변화가 붙을 때 후보가 된다")
+        if sectors.get("바이오/헬스케어", {}).get("headline") != DATA_MISSING and market_score is not None and market_score <= 3:
+            reasons.append("바이오는 시장이 공격 일변도가 아닐 때 개별 이벤트 중심으로 선별 대응하기 좋다")
+        if reasons:
+            return " | ".join(reasons[:3])
+        return ANALYSIS_PENDING
+
     def _market_tradeability(self, stance: str, evidence_score: str) -> str:
         if stance == DATA_MISSING or evidence_score == DATA_MISSING:
             return "오늘 매매 가능 여부는 데이터 미수집 (매크로·가격 근거 부족)"
@@ -1953,6 +2504,127 @@ class ReportDataBuilder:
         if stance == "중립" and score >= 2:
             return "선별적으로 매매 가능한 날이다. 섹터와 종목의 동시 확인이 필요하다."
         return "보수적으로 접근해야 하는 날이다. 신규 진입보다 관망 또는 축소가 우선이다."
+
+    def _extract_rate_from_market_text(self, text: str) -> float | None:
+        if text == DATA_MISSING:
+            return None
+        match = re.search(r"등락률 ([+-]?\d+(?:\.\d+)?)%", text)
+        if not match:
+            return None
+        return _safe_float(match.group(1))
+
+    def _leading_sectors_text(self, sectors: dict[str, dict[str, str]]) -> str:
+        items: list[str] = []
+        for sector in ("반도체", "AI", "자동차/현대차", "바이오/헬스케어", "로봇"):
+            if sectors.get(sector, {}).get("headline") != DATA_MISSING:
+                items.append(sector)
+        return ", ".join(items[:3]) if items else DATA_MISSING
+
+    def _hyundai_day_return(self, hyundai: dict[str, str]) -> float | None:
+        current = _safe_float(str(hyundai.get("current_close", DATA_MISSING)).replace(",", ""))
+        prev_close = _safe_float(str(hyundai.get("previous_close", DATA_MISSING)).replace(",", ""))
+        if current is None or prev_close in (None, 0):
+            return None
+        return ((current - prev_close) / prev_close) * 100
+
+    def _closing_market_day_summary(self, common: dict[str, Any], hyundai: dict[str, str]) -> str:
+        kospi = common.get("korea_market", {}).get("kospi", DATA_MISSING)
+        kosdaq = common.get("korea_market", {}).get("kosdaq", DATA_MISSING)
+        hyundai_return = self._hyundai_day_return(hyundai)
+        hyundai_text = _fmt_pct(hyundai_return) if hyundai_return is not None else DATA_MISSING
+        if kospi == DATA_MISSING and kosdaq == DATA_MISSING:
+            return ANALYSIS_PENDING
+        return f"KOSPI {kospi} | KOSDAQ {kosdaq} | 현대차 등락률 {hyundai_text}"
+
+    def _closing_market_move_reason(self, common: dict[str, Any], sectors: dict[str, dict[str, str]], hyundai: dict[str, str]) -> str:
+        kospi_rate = self._extract_rate_from_market_text(common.get("korea_market", {}).get("kospi", DATA_MISSING))
+        leaders = self._leading_sectors_text(sectors)
+        hyundai_return = self._hyundai_day_return(hyundai)
+        notes: list[str] = []
+        if kospi_rate is not None:
+            if kospi_rate > 0:
+                notes.append("지수 상승의 직접 배경은 위험선호 회복과 대형주 반등 시도다")
+            elif kospi_rate < 0:
+                notes.append("지수 하락의 직접 배경은 위험회피 확대와 대형주 차익실현이다")
+        if leaders != DATA_MISSING:
+            notes.append(f"오늘 주도 흐름은 {leaders} 쪽에서 형성됐다")
+        if hyundai_return is not None:
+            if hyundai_return < 0:
+                notes.append("현대차가 지수보다 약하면 자동차는 시장 주도보다 후행 또는 소외로 해석해야 한다")
+            elif hyundai_return > 0:
+                notes.append("현대차가 동반 강세면 자동차도 지수 확산에 기여했을 가능성이 있다")
+        return " | ".join(notes) if notes else ANALYSIS_PENDING
+
+    def _closing_market_problem(self, common: dict[str, Any], sectors: dict[str, dict[str, str]], hyundai: dict[str, str]) -> str:
+        problems: list[str] = []
+        if common.get("flow", {}).get("foreign") == DATA_MISSING:
+            problems.append("외국인·기관 실시간 수급이 비어 있어 상승/하락의 질을 정량 확인하기 어렵다")
+        if self._leading_sectors_text(sectors) != DATA_MISSING:
+            problems.append("시장이 소수 주도 섹터에 집중되면 지수와 체감 수익률이 쉽게 분리된다")
+        hyundai_return = self._hyundai_day_return(hyundai)
+        if hyundai_return is not None and hyundai_return < 0:
+            problems.append("현대차 약세는 경기민감주 확산이 아직 부족하다는 신호일 수 있다")
+        usdkrw_delta = common.get("fred", {}).get("usdkrw", {}).get("delta")
+        if usdkrw_delta is not None and usdkrw_delta > 0:
+            problems.append("원/달러 상승은 외국인 수급과 수입물가 측면에서 한국장 리스크를 남긴다")
+        return " | ".join(problems) if problems else ANALYSIS_PENDING
+
+    def _closing_market_sentiment_view(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        stance = self._stance_from_score(self._market_score(common))
+        if stance == DATA_MISSING:
+            return ANALYSIS_PENDING
+        leader_text = self._leading_sectors_text(sectors)
+        hyundai_return = self._hyundai_day_return(hyundai)
+        if stance == "중립":
+            if hyundai_return is not None and hyundai_return < 0:
+                return f"심리는 중립이지만 확산형 강세가 아니라 선택형 반등에 가깝다. 주도 섹터는 {leader_text}이고 자동차는 아직 확인이 더 필요하다."
+            return f"심리는 중립이며 주도 섹터는 {leader_text}다. 내일은 지수보다 업종 확산 여부가 더 중요하다."
+        if stance == "공격":
+            return f"심리는 공격 우위지만 최근 변동성이 커서 {leader_text} 추격보다 눌림 확인이 우선이다."
+        return f"심리는 방어 우위다. {leader_text}가 살아 있어도 개별 종목 추격은 제한해야 한다."
+
+    def _closing_hyundai_day_view(self, hyundai: dict[str, str]) -> str:
+        day_return = self._hyundai_day_return(hyundai)
+        current = hyundai.get("current_close", DATA_MISSING)
+        high_low = hyundai.get("intraday_high_low", DATA_MISSING)
+        if day_return is None:
+            return ANALYSIS_PENDING
+        if day_return < 0:
+            return f"현대차는 종가 {current}, 장중 범위 {high_low} 기준 약세 마감이다. 지수와 비동행이면 자동차 업종 수급 복원이 아직 부족하다는 뜻으로 읽는다."
+        return f"현대차는 종가 {current}, 장중 범위 {high_low} 기준 반등 마감이다. 다만 업종 동행과 다음날 지속성이 확인돼야 추세 전환 해석이 가능하다."
+
+    def _closing_horizon_outlook(self, horizon: str, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        stance = self._stance_from_score(self._market_score(common))
+        leaders = self._leading_sectors_text(sectors)
+        hyundai_return = self._hyundai_day_return(hyundai)
+        usdkrw_delta = common.get("fred", {}).get("usdkrw", {}).get("delta")
+        if horizon == "tomorrow":
+            return f"내일은 {leaders} 지속 여부와 현대차 후행 동참 여부를 함께 봐야 한다. 기본 태도는 {stance}이며, 원/달러가 {'상승 중이라 부담이 남아 있다' if usdkrw_delta is not None and usdkrw_delta > 0 else '안정이면 대형주 심리 완충이 가능하다'}."
+        if horizon == "next_week":
+            return f"다음주는 최근 급등락이 기술적 반등인지 추세 복원인지 판별하는 구간이다. {leaders}가 계속 주도하면 지수는 버틸 수 있지만, 자동차와 다른 경기민감주 확산이 없으면 체감 강도는 약할 수 있다."
+        if horizon == "one_month":
+            if hyundai_return is not None and hyundai_return < 0:
+                return "1개월 시계열은 반도체/AI 주도와 자동차 소외가 계속 분리될 가능성을 열어둬야 한다. 현대차는 실적·환율·수요 확인 전까지 지수 대비 후행할 수 있다."
+            return "1개월 시계열은 변동성은 크더라도 실적 시즌과 환율 흐름이 뒷받침되면 대형주 중심 복원 가능성을 본다."
+        return "6개월 시계열은 결국 실적과 금리 방향이 결정한다. 단기 뉴스보다 AI 투자 지속성, 한국 수출 경기, 현대차 실적 회복 여부가 중기 방향성을 좌우할 가능성이 높다."
+
+    def _closing_bull_case(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        leaders = self._leading_sectors_text(sectors)
+        return f"{leaders} 주도력이 유지되고 원/달러 부담이 완화되며 현대차가 업종 동행 강세로 돌아오면 단기 반등이 추세 복원으로 진화할 수 있다."
+
+    def _closing_bear_case(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        return "반도체 급등분이 되돌려지고 원/달러가 다시 상승하며 현대차까지 저점 재이탈하면 최근 반등은 단순 숏커버에 그쳤다고 봐야 한다."
+
+    def _closing_invalidation_case(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        return "지수는 강한데 현대차·자동차가 계속 비동행하거나, 주도 섹터가 하루 만에 급반전하면 낙관 시나리오를 즉시 낮춰야 한다."
+
+    def _closing_must_watch(self, common: dict[str, Any], hyundai: dict[str, str], sectors: dict[str, dict[str, str]]) -> str:
+        points = [
+            "원/달러 추가 방향",
+            "반도체 주도력 지속 여부",
+            "현대차와 기아 동행 여부",
+        ]
+        return " | ".join(points)
 
     def _market_bias(self, common: dict[str, Any], stance: str) -> str:
         if stance == DATA_MISSING:
@@ -2087,7 +2759,40 @@ class ReportDataBuilder:
             payload[f"{prefix}_down_reason"] = slot["down_reason"] if slot else "자동 선별 후보 없음"
             payload[f"{prefix}_up_reason"] = slot["up_reason"] if slot else "자동 선별 후보 없음"
             payload[f"{prefix}_forecast"] = slot["forecast"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_target_price"] = slot["target_price"] if slot else DATA_MISSING
+            payload[f"{prefix}_target_price_view"] = slot["target_price_view"] if slot else "자동 선별 후보 없음"
+            payload[f"{prefix}_target_price_basis"] = slot["target_price_basis"] if slot else "자동 선별 후보 없음"
         return payload
+
+    def _sector_stock_recent_disclosures(self, stock_frame: dict[str, str], disclosures: dict[str, Any]) -> str:
+        items_by_company = disclosures.get("items_by_company", {})
+        parts: list[str] = []
+        for index in range(1, 4):
+            name = stock_frame.get(f"stock_{index}_name", DATA_MISSING)
+            if name == DATA_MISSING:
+                continue
+            items = items_by_company.get(name, [])
+            if items:
+                latest = items[0]
+                parts.append(f"{name}: {latest.report_name} ({latest.filed_at})")
+            else:
+                parts.append(f"{name}: {DATA_MISSING}")
+        return " | ".join(parts) if parts else DATA_MISSING
+
+    def _sector_stock_disclosure_summary(self, stock_frame: dict[str, str], disclosures: dict[str, Any]) -> str:
+        items_by_company = disclosures.get("items_by_company", {})
+        parts: list[str] = []
+        for index in range(1, 4):
+            name = stock_frame.get(f"stock_{index}_name", DATA_MISSING)
+            if name == DATA_MISSING:
+                continue
+            items = items_by_company.get(name, [])
+            if items:
+                latest = items[0]
+                parts.append(f"{name} 공시 확인: {latest.report_name}")
+            else:
+                parts.append(f"{name} 공시 확인: {DATA_MISSING}")
+        return " | ".join(parts) if parts else DATA_MISSING
 
     def _auto_select_stock_candidates(
         self,
@@ -2123,6 +2828,7 @@ class ReportDataBuilder:
         sector_data = sectors.get(sector, {})
         headline = sector_data.get("headline", DATA_MISSING)
         disclosure = self._latest_company_disclosure(name, disclosures)
+        target_snapshot = self._stock_target_snapshot(name)
         reason_parts = [f"{sector} 우선 관찰"]
         if headline != DATA_MISSING:
             reason_parts.append(f"섹터 뉴스: {headline}")
@@ -2143,6 +2849,9 @@ class ReportDataBuilder:
             "down_reason": self._generic_stock_down_reason(name, sector, headline, disclosure),
             "up_reason": self._generic_stock_up_reason(name, sector, headline, disclosure),
             "forecast": self._generic_stock_forecast(name, sector, headline, disclosure),
+            "target_price": target_snapshot["target_price"],
+            "target_price_view": target_snapshot["target_price_view"],
+            "target_price_basis": target_snapshot["target_price_basis"],
         }
 
     def _latest_company_disclosure(self, company_name: str, disclosures: dict[str, Any]) -> str:
@@ -2354,6 +3063,20 @@ class ReportDataBuilder:
         if current > ma20:
             return f"{name} 예측: 20일선 위 안착이 이어지면 재상승 시도 가능. 다만 거래량 확인 없이 추세 연장으로 단정하지 말 것."
         return f"{name} 예측: 20일선 회복 전까지는 반등보다 저항 확인 구간이다. 반등 실패 시 재차 눌림 가능성을 열어둬야 한다."
+
+    def _favorite_add_rule(self, current: float | None, ma20: float | None, name: str) -> str:
+        if current is None or ma20 is None:
+            return f"{name} 추가매수 기준은 데이터 미수집 (종가·20일선 부족)"
+        if current >= ma20:
+            return f"{name}는 20일선({_fmt_number(ma20)}) 지지 확인 후 분할 추가."
+        return f"{name}는 20일선({_fmt_number(ma20)}) 회복 전 추가매수 보류."
+
+    def _favorite_exit_rule(self, current: float | None, ma20: float | None, name: str) -> str:
+        if current is None or ma20 is None:
+            return f"{name} 매도 기준은 데이터 미수집 (종가·20일선 부족)"
+        if current < ma20:
+            return f"{name}는 20일선({_fmt_number(ma20)}) 이탈 지속 시 비중 축소."
+        return f"{name}는 20일선({_fmt_number(ma20)}) 종가 이탈 전까지 추세 유지 관점."
 
     def _hyundai_analysis(self, current: float | None, ma20: float | None, ma60: float | None) -> str:
         if current is None or ma20 is None or ma60 is None:

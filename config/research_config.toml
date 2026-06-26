@@ -79,6 +79,7 @@ stock_code = "005930"
 name = "디앤디파마텍"
 dart_name = "디앤디파마텍"
 market = "KOSDAQ"
+stock_code = "347850"
 
 [naming]
 daily_pattern = "{date}-{session}.md"
