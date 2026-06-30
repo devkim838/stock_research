@@ -5,6 +5,7 @@ import json
 import hashlib
 import math
 import os
+import sys
 import re
 import calendar
 import tomllib
@@ -21,10 +22,20 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "research_config.toml"
 KRX_CACHE_DIR = ROOT / ".cache" / "krx"
+VENDOR_DIR = ROOT / ".vendor"
+
+if VENDOR_DIR.exists():
+    sys.path.insert(0, str(VENDOR_DIR))
+
+os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".cache" / "matplotlib"))
+
+try:
+    from pykrx import stock as pykrx_stock
+except ImportError:
+    pykrx_stock = None
 
 DATA_MISSING = "데이터 미수집"
 ANALYSIS_PENDING = "필수 데이터 부족으로 분석 보류"
@@ -66,6 +77,17 @@ MASSIVE_SECTOR_TICKERS = {
     "바이오/헬스케어": "LLY",
     "ETF: SCHD, QQQM, SPYG": "SCHD",
 }
+
+KRX_FLOW_RANKING_KEYS = (
+    "kospi_foreign_buy",
+    "kospi_foreign_sell",
+    "kosdaq_foreign_buy",
+    "kosdaq_foreign_sell",
+    "kospi_institutional_buy",
+    "kospi_institutional_sell",
+    "kosdaq_institutional_buy",
+    "kosdaq_institutional_sell",
+)
 
 TRUSTED_NEWS_SOURCES = {
     "reuters", "bloomberg", "cnbc", "wsj", "financial times", "marketwatch",
@@ -749,6 +771,15 @@ class ApiClient:
             return items if isinstance(items, list) else [items]
         return []
 
+    def krx_ranking_rows(self, path: str, bas_date: str) -> list[dict[str, Any]]:
+        payload = self.krx_query(path, basDd=bas_date)
+        if not payload:
+            return []
+        items = payload.get("OutBlock_1")
+        if not items:
+            return []
+        return items if isinstance(items, list) else [items]
+
     def dart_disclosures(self, corp_name: str, target_date: date, lookback_days: int = 30) -> list[DisclosureItem]:
         corp_code = self.dart_corp_code(corp_name)
         if not self.dart_key or not corp_code:
@@ -886,14 +917,16 @@ class ReportDataBuilder:
         self.tracked_companies = CONFIG["tracked_companies"]
 
     def build(self, session: str, target_date: date) -> dict[str, Any]:
-        common = self._build_common_data(target_date)
+        korea_ref_date = self._resolve_korea_reference_date(session, target_date)
+        common = self._build_common_data(target_date, korea_ref_date)
         sectors = self._build_sector_data(target_date)
         disclosures = self._build_disclosures(target_date)
-        hyundai = self._build_hyundai_data(target_date, disclosures)
-        favorites = self._build_favorite_stocks(target_date, hyundai, sectors, disclosures)
+        hyundai = self._build_hyundai_data(korea_ref_date, disclosures)
+        favorites = self._build_favorite_stocks(korea_ref_date, hyundai, sectors, disclosures)
         session_data = self._build_session_data(session, common, hyundai, sectors, disclosures)
         return {
             "session_name": session,
+            "korea_reference_date": korea_ref_date.isoformat(),
             "session": session_data,
             "common": common,
             "hyundai": hyundai,
@@ -904,11 +937,17 @@ class ReportDataBuilder:
             "closing": self._build_closing_data(common, hyundai, sectors),
         }
 
-    def _build_common_data(self, target_date: date) -> dict[str, dict[str, str]]:
+    def _resolve_korea_reference_date(self, session: str, target_date: date) -> date:
+        if session == "morning":
+            return target_date - timedelta(days=1)
+        return target_date
+
+    def _build_common_data(self, target_date: date, korea_ref_date: date) -> dict[str, dict[str, str]]:
         fred = self._build_fred_snapshot(target_date)
         gold = self._build_gold_snapshot(target_date)
-        krx_market = self._build_krx_market_data(target_date)
+        krx_market = self._build_krx_market_data(korea_ref_date)
         kis_market = self._build_kis_market_data()
+        flow_rankings = self._build_krx_flow_rankings(korea_ref_date)
         return {
             "market_summary": {
                 "structure": self._macro_structure_text(fred),
@@ -938,6 +977,7 @@ class ReportDataBuilder:
                 "retail": kis_market["retail"],
                 "analysis": kis_market["analysis"],
             },
+            "flow_rankings": flow_rankings,
             "missing_reasons": {
                 "korea_index": self._compose_korea_index_reason(
                     self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
@@ -946,6 +986,8 @@ class ReportDataBuilder:
                     kis_market["korea_index_reason"],
                 ),
                 "investor_flow": kis_market["investor_flow_reason"],
+                "flow_rankings": flow_rankings["reason"],
+                "korea_reference_date": korea_ref_date.isoformat(),
             },
         }
 
@@ -1061,7 +1103,7 @@ class ReportDataBuilder:
         kosdaq_value = DATA_MISSING
         kospi_reason = DATA_MISSING
         kosdaq_reason = DATA_MISSING
-        for days_back in range(1, 8):
+        for days_back in range(0, 7):
             query_date = (target_date - timedelta(days=days_back)).strftime("%Y%m%d")
             if kospi_value == DATA_MISSING:
                 rows = self.client.krx_kospi_daily(query_date)
@@ -1120,6 +1162,185 @@ class ReportDataBuilder:
             "korea_index_reason": "index_price_path 미설정 또는 응답 파싱 로직 미구현" if not index_payload else "응답 파싱 로직 미구현",
             "investor_flow_reason": "investor_flow_path 미설정 또는 응답 파싱 로직 미구현" if not flow_payload else "응답 파싱 로직 미구현",
         }
+
+    def _build_krx_flow_rankings(self, target_date: date) -> dict[str, Any]:
+        pykrx_result = self._build_pykrx_flow_rankings(target_date)
+        if pykrx_result.get("markets"):
+            return pykrx_result
+
+        ranking_paths = CONFIG["api"]["krx"].get("investor_rankings", {})
+        if not any(str((ranking_paths or {}).get(key, "") or "").strip() for key in KRX_FLOW_RANKING_KEYS):
+            return pykrx_result
+
+        default_result: dict[str, Any] = {
+            "as_of": target_date.isoformat(),
+            "source": "KRX OpenAPI",
+            "amount_unit": "단위 미확인",
+            "quantity_unit": "단위 미확인",
+            "volume_unit": "주",
+            "markets": {},
+            "reason": DATA_MISSING,
+        }
+        if not self.client.krx_key:
+            if pykrx_result.get("reason"):
+                default_result["reason"] = pykrx_result["reason"]
+                return default_result
+            default_result["reason"] = f'{CONFIG["api"]["krx"]["enabled_env"]} 미설정'
+            return default_result
+        if not isinstance(ranking_paths, dict):
+            default_result["reason"] = "KRX 투자주체 수급 상위 설정 파싱 실패"
+            return default_result
+
+        query_date = target_date.strftime("%Y%m%d")
+        collected: dict[str, list[dict[str, str]]] = {}
+        reasons: list[str] = []
+        as_of_text = default_result["as_of"]
+        configured_paths = 0
+        for key in KRX_FLOW_RANKING_KEYS:
+            path = str(ranking_paths.get(key, "") or "").strip()
+            if not path:
+                continue
+            configured_paths += 1
+            rows = self.client.krx_ranking_rows(path, query_date)
+            if not rows:
+                reasons.append(f"{key}: {self.client.krx_last_error or '빈 응답'}")
+                continue
+            normalized_rows: list[dict[str, str]] = []
+            for row in rows[:10]:
+                normalized = self._normalize_krx_flow_ranking_row(row)
+                if normalized:
+                    normalized_rows.append(normalized)
+                bas_date = str(row.get("BAS_DD", "")).strip()
+                if bas_date and len(bas_date) == 8 and bas_date.isdigit():
+                    as_of_text = f"{bas_date[:4]}-{bas_date[4:6]}-{bas_date[6:8]}"
+            if normalized_rows:
+                collected[key] = normalized_rows
+            else:
+                reasons.append(f"{key}: 응답 정규화 실패")
+
+        default_result["markets"] = collected
+        default_result["as_of"] = as_of_text
+        if collected:
+            default_result["reason"] = ""
+        elif configured_paths == 0:
+            default_result["reason"] = "KRX 투자주체 수급 상위 경로 미설정"
+        elif reasons:
+            default_result["reason"] = "; ".join(reasons[:4])
+        else:
+            default_result["reason"] = "KRX 투자주체 수급 상위 데이터 미수집"
+        return default_result
+
+    def _build_pykrx_flow_rankings(self, target_date: date) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "as_of": target_date.isoformat(),
+            "source": "PyKRX",
+            "amount_unit": "백만원",
+            "quantity_unit": "주",
+            "volume_unit": "주",
+            "markets": {},
+            "reason": DATA_MISSING,
+        }
+        if pykrx_stock is None:
+            result["reason"] = "pykrx 미설치"
+            return result
+        if not os.getenv("KRX_ID") or not os.getenv("KRX_PW"):
+            result["reason"] = "PyKRX 투자자 수급 조회에는 KRX_ID, KRX_PW가 필요함"
+            return result
+
+        reasons: list[str] = []
+        for days_back in range(0, 7):
+            query_dt = target_date - timedelta(days=days_back)
+            query_date = query_dt.strftime("%Y%m%d")
+            try:
+                kospi_volume = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSPI")
+                kosdaq_volume = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSDAQ")
+                kospi_fund = pykrx_stock.get_market_fundamental_by_ticker(query_date, "KOSPI")
+                kosdaq_fund = pykrx_stock.get_market_fundamental_by_ticker(query_date, "KOSDAQ")
+            except Exception as error:
+                reasons.append(f"{query_date} 기초데이터: {error}")
+                continue
+
+            market_specs = (
+                ("KOSPI", "외국인", "kospi_foreign_buy", "kospi_foreign_sell", kospi_volume, kospi_fund),
+                ("KOSDAQ", "외국인", "kosdaq_foreign_buy", "kosdaq_foreign_sell", kosdaq_volume, kosdaq_fund),
+                ("KOSPI", "기관합계", "kospi_institutional_buy", "kospi_institutional_sell", kospi_volume, kospi_fund),
+                ("KOSDAQ", "기관합계", "kosdaq_institutional_buy", "kosdaq_institutional_sell", kosdaq_volume, kosdaq_fund),
+            )
+
+            day_reasons: list[str] = []
+            day_markets: dict[str, list[dict[str, str]]] = {}
+            for market, investor, buy_key, sell_key, volume_df, fund_df in market_specs:
+                try:
+                    ranking_df = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, market, investor)
+                except Exception as error:
+                    day_reasons.append(f"{market} {investor}: {error}")
+                    continue
+                if ranking_df is None or ranking_df.empty:
+                    day_reasons.append(f"{market} {investor}: 빈 응답")
+                    continue
+
+                buy_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, positive=True)
+                sell_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, positive=False)
+                if buy_rows:
+                    day_markets[buy_key] = buy_rows
+                if sell_rows:
+                    day_markets[sell_key] = sell_rows
+
+            if day_markets:
+                result["markets"] = day_markets
+                result["as_of"] = query_dt.isoformat()
+                result["reason"] = ""
+                return result
+            reasons.extend(day_reasons)
+
+        if reasons:
+            result["reason"] = "; ".join(reasons[:4])
+        else:
+            result["reason"] = "PyKRX 투자자 수급 상위 데이터 미수집"
+        return result
+
+    def _normalize_pykrx_ranking_df(
+        self,
+        ranking_df: Any,
+        volume_df: Any,
+        fundamental_df: Any,
+        *,
+        positive: bool,
+    ) -> list[dict[str, str]]:
+        amount_column = "순매수거래대금"
+        quantity_column = "순매수거래량"
+        name_column = "종목명"
+        volume_column = "거래량"
+        if amount_column not in ranking_df.columns or quantity_column not in ranking_df.columns or name_column not in ranking_df.columns:
+            return []
+
+        filtered = ranking_df[ranking_df[amount_column] > 0] if positive else ranking_df[ranking_df[amount_column] < 0]
+        if filtered.empty:
+            return []
+        filtered = filtered.sort_values(amount_column, ascending=not positive).head(10)
+
+        rows: list[dict[str, str]] = []
+        for ticker, row in filtered.iterrows():
+            total_volume = DATA_MISSING
+            per_text = DATA_MISSING
+            pbr_text = DATA_MISSING
+            if volume_df is not None and ticker in getattr(volume_df, "index", []):
+                total_volume = self._fmt_krx_int(volume_df.loc[ticker].get(volume_column))
+            if fundamental_df is not None and ticker in getattr(fundamental_df, "index", []):
+                fund_row = fundamental_df.loc[ticker]
+                per_text = self._fmt_krx_metric(fund_row.get("PER"))
+                pbr_text = self._fmt_krx_metric(fund_row.get("PBR"))
+            rows.append(
+                {
+                    "name": str(row.get(name_column, DATA_MISSING)),
+                    "amount": self._fmt_krx_int(int(abs(row.get(amount_column, 0)) / 1_000_000)),
+                    "investor_quantity": self._fmt_krx_int(abs(int(row.get(quantity_column, 0)))),
+                    "total_volume": total_volume,
+                    "per": per_text,
+                    "pbr": pbr_text,
+                }
+            )
+        return rows
 
     def _dart_financial_report_candidates(self, target_date: date) -> list[tuple[int, str, str]]:
         year = target_date.year
@@ -1360,7 +1581,7 @@ class ReportDataBuilder:
                 "short_selling": DATA_MISSING,
             }
         daily_path = CONFIG["api"]["krx"]["stk_daily_path"] if market == "KOSPI" else CONFIG["api"]["krx"]["ksq_daily_path"]
-        for days_back in range(1, 8):
+        for days_back in range(0, 7):
             query_date = (target_date - timedelta(days=days_back)).strftime("%Y%m%d")
             rows = self.client.krx_stock_daily(daily_path, query_date, stock_code)
             if not rows:
@@ -2183,7 +2404,7 @@ class ReportDataBuilder:
             "krx_reason": common["missing_reasons"]["korea_index"],
             "kis_reason": f"{kis_key_name} 또는 {kis_secret_name} 환경변수 미설정으로 한국장 지수/수급 미수집" if kis_ok == "미연결" else "KIS 키는 준비됨. 엔드포인트 경로와 응답 파싱 로직 연결 필요",
             "hyundai_reason": hyundai_reason,
-            "flow_reason": "외국인/기관/개인 수급은 국내 브로커 또는 거래소 API가 필요함",
+            "flow_reason": common["missing_reasons"].get("flow_rankings") or "KRX 투자주체 수급 상위 연결됨",
             "news_reason": "뉴스는 수집되지만 국내 관련 종목 가격 반응 데이터가 없어 정량 영향 평가는 제한적임",
         }
 
@@ -2929,6 +3150,41 @@ class ReportDataBuilder:
                 return lowered[key.lower()]
         return None
 
+    def _normalize_krx_flow_ranking_row(self, row: dict[str, Any]) -> dict[str, str] | None:
+        name = self._krx_row_value(row, "ISU_NM", "ISU_ABBRV", "SRT_CD_NM", "STK_NM", "ISU_NM_KOR")
+        if not name:
+            return None
+        return {
+            "name": str(name).strip(),
+            "amount": self._fmt_krx_int(
+                self._krx_row_value(
+                    row,
+                    "NTBY_TRDVAL",
+                    "NET_BUY_TRDVAL",
+                    "NETBY_TRDVAL",
+                    "INVST_NTBY_TRDVAL",
+                    "FRGN_NTBY_TRDVAL",
+                    "ORG_NTBY_TRDVAL",
+                    "TRDVAL",
+                )
+            ),
+            "investor_quantity": self._fmt_krx_int(
+                self._krx_row_value(
+                    row,
+                    "NTBY_QTY",
+                    "NET_BUY_QTY",
+                    "NETBY_QTY",
+                    "INVST_NTBY_QTY",
+                    "FRGN_NTBY_QTY",
+                    "ORG_NTBY_QTY",
+                    "QTY",
+                )
+            ),
+            "total_volume": self._fmt_krx_int(self._krx_row_value(row, "ACC_TRDVOL", "TDD_TRDVOL", "TRDVOL")),
+            "per": self._fmt_krx_metric(self._krx_row_value(row, "PER", "TDD_PER", "PR_RATIO")),
+            "pbr": self._fmt_krx_metric(self._krx_row_value(row, "PBR", "TDD_PBR", "PBR_RATIO")),
+        }
+
     def _krx_previous_close_text(self, row: dict[str, Any]) -> str:
         previous_close = self._krx_row_value(row, "PREV_CLSPRC", "TDD_OPNPRC", "OPNPRC")
         if previous_close not in (None, ""):
@@ -2997,6 +3253,18 @@ class ReportDataBuilder:
     def _fmt_krx_int(self, value: Any) -> str:
         parsed = _safe_float(str(value).replace(",", "")) if value not in (None, "") else None
         return _fmt_int(int(parsed) if parsed is not None else None)
+
+    def _fmt_krx_metric(self, value: Any) -> str:
+        if value in (None, ""):
+            return DATA_MISSING
+        text = str(value).strip()
+        if not text:
+            return DATA_MISSING
+        parsed = _safe_float(text.replace(",", ""))
+        if parsed is None:
+            return text
+        formatted = f"{parsed:,.2f}"
+        return formatted.rstrip("0").rstrip(".")
 
     def _fmt_signed_krx_value(self, value: Any) -> str:
         parsed = _safe_float(str(value).replace(",", "")) if value not in (None, "") else None

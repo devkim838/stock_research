@@ -16,6 +16,17 @@ SECTOR_SPECS = [
 
 WATCHLIST_FILE_STOCKS = ("현대차", "디앤디파마텍")
 
+FLOW_RANKING_TITLES = {
+    "kospi_foreign_buy": "코스피 외국인 순매수 상위 1~10",
+    "kospi_foreign_sell": "코스피 외국인 순매도 상위 1~10",
+    "kosdaq_foreign_buy": "코스닥 외국인 순매수 상위 1~10",
+    "kosdaq_foreign_sell": "코스닥 외국인 순매도 상위 1~10",
+    "kospi_institutional_buy": "코스피 기관 순매수 상위 1~10",
+    "kospi_institutional_sell": "코스피 기관 순매도 상위 1~10",
+    "kosdaq_institutional_buy": "코스닥 기관 순매수 상위 1~10",
+    "kosdaq_institutional_sell": "코스닥 기관 순매도 상위 1~10",
+}
+
 
 def with_missing_reason(value: str, reason: str) -> str:
     if value == DATA_MISSING:
@@ -51,6 +62,44 @@ def stock_label(name: str, sector: str) -> str:
     if sector == DATA_MISSING:
         return name
     return f"{name} ({sector})"
+
+
+def build_flow_ranking_section(flow_rankings: dict | None = None, missing_reason: str = DATA_MISSING) -> str:
+    flow_rankings = flow_rankings or {}
+    markets = flow_rankings.get("markets", {})
+    lines = [
+        "## 수급 상위",
+        "",
+        f"- 기준일: {flow_rankings.get('as_of', DATA_MISSING)}",
+        f"- 출처: {flow_rankings.get('source', DATA_MISSING)}",
+        f"- 금액 단위: {flow_rankings.get('amount_unit', '단위 미확인')}",
+        f"- 투자주체 수량 단위: {flow_rankings.get('quantity_unit', '단위 미확인')}",
+        f"- 총거래량 단위: {flow_rankings.get('volume_unit', '주')}",
+        "",
+    ]
+    if not markets:
+        lines.append(f"- 데이터 미수집 사유: {missing_reason}")
+        return "\n".join(lines)
+
+    for key, title in FLOW_RANKING_TITLES.items():
+        lines.extend([f"### {title}", ""])
+        items = markets.get(key, [])
+        if not items:
+            lines.append(f"- 데이터 미수집: {missing_reason}")
+            lines.append("")
+            continue
+        subject_label = "외국인수량" if "foreign" in key else "기관수량"
+        for index, item in enumerate(items[:10], start=1):
+            lines.append(
+                f"{index}. {item.get('name', DATA_MISSING)} | "
+                f"금액 {item.get('amount', DATA_MISSING)}({flow_rankings.get('amount_unit', '단위 미확인')}) | "
+                f"총거래량 {item.get('total_volume', DATA_MISSING)}{flow_rankings.get('volume_unit', '주')} | "
+                f"{subject_label} {item.get('investor_quantity', DATA_MISSING)}({flow_rankings.get('quantity_unit', '단위 미확인')}) | "
+                f"PER {item.get('per', DATA_MISSING)} | "
+                f"PBR {item.get('pbr', DATA_MISSING)}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def build_top_news_lines(report_data: dict | None = None) -> list[str]:
@@ -112,8 +161,9 @@ def build_common_sections(report_data: dict | None = None) -> str:
     rates = common.get("rates", {})
     fx_commodities = common.get("fx_commodities", {})
     korea_market = common.get("korea_market", {})
-    flow = common.get("flow", {})
+    flow_rankings = common.get("flow_rankings", {})
     missing_reasons = common.get("missing_reasons", {})
+    korea_reference_date = (report_data or {}).get("korea_reference_date", DATA_MISSING)
     sections = ["<!-- TODO: API 연동 시 지수/금리/환율/원자재/수급 데이터를 자동 주입할 것. -->"]
     if session_name != "morning":
         sections.extend(
@@ -148,19 +198,19 @@ def build_common_sections(report_data: dict | None = None) -> str:
             "",
             f"- KOSPI: {korea_market.get('kospi', DATA_MISSING)}",
             f"- KOSDAQ: {korea_market.get('kosdaq', DATA_MISSING)}",
+            f"- 한국장 기준일: {korea_reference_date}",
             f"- 주도 업종: {korea_market.get('leaders', ANALYSIS_PENDING)}",
             f"- 시장 폭과 질: {korea_market.get('breadth', ANALYSIS_PENDING)}",
             f"- 미수집 사유: {missing_reasons.get('korea_index', DATA_MISSING)}",
-            "",
-            "## 외국인/기관/개인 수급",
-            "",
-            f"- 외국인 수급: {with_missing_reason(flow.get('foreign', DATA_MISSING), missing_reasons.get('investor_flow', DATA_MISSING))}",
-            f"- 기관 수급: {with_missing_reason(flow.get('institutional', DATA_MISSING), missing_reasons.get('investor_flow', DATA_MISSING))}",
-            f"- 개인 수급: {with_missing_reason(flow.get('retail', DATA_MISSING), missing_reasons.get('investor_flow', DATA_MISSING))}",
-            f"- 수급 해석: {flow.get('analysis', ANALYSIS_PENDING)}",
-            f"- 미수집 사유: {missing_reasons.get('investor_flow', DATA_MISSING)}",
         ]
     )
+    if session_name in {"morning", "closing"}:
+        sections.extend(
+            [
+                "",
+                build_flow_ranking_section(flow_rankings, missing_reasons.get("flow_rankings", DATA_MISSING)),
+            ]
+        )
     return "\n".join(sections)
 
 
@@ -336,6 +386,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 섹터 체크포인트: {session_data.get('sector_watchpoints', ANALYSIS_PENDING)}",
                 f"- 섹터에서 하지 말아야 할 행동: {session_data.get('sector_avoid', ANALYSIS_PENDING)}",
                 "",
+                "## 색터별 최근 공시",
+                "",
+                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
+                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
+                "",
                 "## 섹터 개별주",
                 "",
                 f"- 자동 선별 1: {stock_label(session_data.get('stock_1_name', DATA_MISSING), session_data.get('stock_1_sector', DATA_MISSING))}",
@@ -367,17 +422,6 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 증권가 목표주가 3: {session_data.get('stock_3_target_price', DATA_MISSING)}",
                 f"- 목표주가 해석 3: {session_data.get('stock_3_target_price_view', ANALYSIS_PENDING)}",
                 f"- 목표주가 근거 3: {session_data.get('stock_3_target_price_basis', ANALYSIS_PENDING)}",
-                "",
-                "## 공통 리스크 관리",
-                "",
-                f"- 신규 진입 금지 조건: {session_data.get('no_trade_condition', ANALYSIS_PENDING)}",
-                f"- 허용 포지션 크기: {session_data.get('position_size_rule', ANALYSIS_PENDING)}",
-                f"- 공통 반대 신호: {session_data.get('opposite_signal', ANALYSIS_PENDING)}",
-                "",
-                "## 최근 공시",
-                "",
-                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
-                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
             ]
         )
     if session == "afternoon":
@@ -405,6 +449,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 오후 우선 볼 섹터: {session_data.get('sector_priority', ANALYSIS_PENDING)}",
                 f"- 섹터 체크포인트: {session_data.get('sector_watchpoints', ANALYSIS_PENDING)}",
                 f"- 섹터에서 하지 말아야 할 행동: {session_data.get('sector_avoid', ANALYSIS_PENDING)}",
+                "",
+                "## 색터별 최근 공시",
+                "",
+                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
+                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
                 "",
                 "## 섹터 개별주",
                 "",
@@ -458,41 +507,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 신규 진입 금지 조건: {session_data.get('no_trade_condition', ANALYSIS_PENDING)}",
                 f"- 허용 포지션 크기: {session_data.get('position_size_rule', ANALYSIS_PENDING)}",
                 f"- 공통 반대 신호: {session_data.get('opposite_signal', ANALYSIS_PENDING)}",
-                "",
-                "## 최근 공시",
-                "",
-                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
-                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
             ]
         )
     if session == "closing":
         return "\n".join(
             [
-                "## 오늘 시장 진단",
-                "",
-                f"- 종가 기준 요약: {session_data.get('market_day_summary', ANALYSIS_PENDING)}",
-                f"- 왜 상승/하락했는지: {session_data.get('market_move_reason', ANALYSIS_PENDING)}",
-                f"- 오늘 시장의 문제점: {session_data.get('market_problem', ANALYSIS_PENDING)}",
-                f"- 수급/심리 해석: {session_data.get('market_sentiment_view', ANALYSIS_PENDING)}",
-                f"- 현대차 당일 해석: {session_data.get('hyundai_day_view', ANALYSIS_PENDING)}",
-                "",
-                "## 오늘 매매 복기",
-                "",
-                summary_hint,
-                "",
-                f"- 진입/청산 내역: {session_data.get('trades', DATA_MISSING)}",
-                f"- 잘한 판단: {session_data.get('good_call', ANALYSIS_PENDING)}",
-                f"- 잘못한 판단: {session_data.get('bad_call', ANALYSIS_PENDING)}",
-                f"- 규칙 위반 여부: {session_data.get('rule_break', ANALYSIS_PENDING)}",
-                f"- 내일 보정할 습관: {session_data.get('habit_fix', ANALYSIS_PENDING)}",
-                "",
-                "## 시장 프레임",
-                "",
-                f"- 내일도 매매 가능한지: {session_data.get('market_tradeability', ANALYSIS_PENDING)}",
-                f"- 시장 기본 방향: {session_data.get('market_bias', ANALYSIS_PENDING)}",
-                f"- 시나리오 전환 조건: {session_data.get('scenario_switch', ANALYSIS_PENDING)}",
-                f"- 시장 리스크 가드: {session_data.get('market_risk_guard', ANALYSIS_PENDING)}",
-                "",
                 "## 시계열 전망",
                 "",
                 f"- 내일 전망: {session_data.get('tomorrow_outlook', ANALYSIS_PENDING)}",
@@ -510,6 +529,11 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 내일 우선 볼 섹터: {session_data.get('sector_priority', ANALYSIS_PENDING)}",
                 f"- 섹터 체크포인트: {session_data.get('sector_watchpoints', ANALYSIS_PENDING)}",
                 f"- 섹터에서 하지 말아야 할 행동: {session_data.get('sector_avoid', ANALYSIS_PENDING)}",
+                "",
+                "## 색터별 최근 공시",
+                "",
+                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
+                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
                 "",
                 "## 섹터 개별주",
                 "",
@@ -563,11 +587,6 @@ def build_session_specific_section(session: str, summary_hint: str, report_data:
                 f"- 신규 진입 금지 조건: {session_data.get('no_trade_condition', ANALYSIS_PENDING)}",
                 f"- 내일 허용 포지션 크기: {session_data.get('position_size_rule', ANALYSIS_PENDING)}",
                 f"- 내일 반대 신호: {session_data.get('opposite_signal', ANALYSIS_PENDING)}",
-                "",
-                "## 최근 공시",
-                "",
-                f"- 최근 공시: {session_data.get('recent_disclosures', DATA_MISSING)}",
-                f"- 공시 요약: {session_data.get('disclosure_summary', DATA_MISSING)}",
             ]
         )
     raise ValueError(f"Unsupported session: {session}")

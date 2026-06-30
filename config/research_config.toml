@@ -34,6 +34,16 @@ ksq_daily_path = "/svc/apis/sto/ksq_bydd_trd"
 stk_base_info_path = "/svc/apis/sto/stk_isu_base_info"
 ksq_base_info_path = "/svc/apis/sto/ksq_isu_base_info"
 
+[api.krx.investor_rankings]
+kospi_foreign_buy = ""
+kospi_foreign_sell = ""
+kosdaq_foreign_buy = ""
+kosdaq_foreign_sell = ""
+kospi_institutional_buy = ""
+kospi_institutional_sell = ""
+kosdaq_institutional_buy = ""
+kosdaq_institutional_sell = ""
+
 [api.kis]
 base_url = "https://openapi.koreainvestment.com:9443"
 token_url = "/oauth2/tokenP"
