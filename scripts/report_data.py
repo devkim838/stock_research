@@ -20,21 +20,24 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
-
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "research_config.toml"
 KRX_CACHE_DIR = ROOT / ".cache" / "krx"
 VENDOR_DIR = ROOT / ".vendor"
+NEWS_QUALITY_LOG = ROOT / "logs" / "news_quality.jsonl"
 
 if VENDOR_DIR.exists():
     sys.path.insert(0, str(VENDOR_DIR))
 
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / ".cache" / "matplotlib"))
 
+from dotenv import load_dotenv
+
+load_dotenv(ROOT / ".env")
+
 try:
     from pykrx import stock as pykrx_stock
-except ImportError:
+except Exception:
     pykrx_stock = None
 
 DATA_MISSING = "데이터 미수집"
@@ -293,6 +296,7 @@ def _fmt_ratio(value: float | None, digits: int = 2) -> str:
 def _parse_int_like(value: str | None) -> int | None:
     if value is None:
         return None
+    value = str(value)
     cleaned = value.replace(",", "").replace(" ", "").strip()
     if not cleaned or cleaned in {"-", "."}:
         return None
@@ -919,7 +923,7 @@ class ReportDataBuilder:
     def build(self, session: str, target_date: date) -> dict[str, Any]:
         korea_ref_date = self._resolve_korea_reference_date(session, target_date)
         common = self._build_common_data(target_date, korea_ref_date)
-        sectors = self._build_sector_data(target_date)
+        sectors = self._build_sector_data(target_date, session)
         disclosures = self._build_disclosures(target_date)
         hyundai = self._build_hyundai_data(korea_ref_date, disclosures)
         favorites = self._build_favorite_stocks(korea_ref_date, hyundai, sectors, disclosures)
@@ -947,7 +951,21 @@ class ReportDataBuilder:
         gold = self._build_gold_snapshot(target_date)
         krx_market = self._build_krx_market_data(korea_ref_date)
         kis_market = self._build_kis_market_data()
+        pykrx_market = self._build_pykrx_market_data(korea_ref_date)
         flow_rankings = self._build_krx_flow_rankings(korea_ref_date)
+        kospi_value = self._prefer_values(kis_market["kospi"], krx_market["kospi"], pykrx_market["kospi"])
+        kosdaq_value = self._prefer_values(kis_market["kosdaq"], krx_market.get("kosdaq", DATA_MISSING), pykrx_market["kosdaq"])
+        foreign_flow = self._prefer_values(kis_market["foreign"], pykrx_market["foreign"])
+        institutional_flow = self._prefer_values(kis_market["institutional"], pykrx_market["institutional"])
+        retail_flow = self._prefer_values(kis_market["retail"], pykrx_market["retail"])
+        investor_flow_reason = DATA_MISSING if any(
+            value != DATA_MISSING for value in (foreign_flow, institutional_flow, retail_flow)
+        ) else self._prefer_values(kis_market["investor_flow_reason"], pykrx_market["investor_flow_reason"])
+        flow_analysis = pykrx_market["analysis"] if any(
+            value != DATA_MISSING for value in (pykrx_market["foreign"], pykrx_market["institutional"], pykrx_market["retail"])
+        ) else kis_market["analysis"]
+        leaders = self._prefer_market_detail(kis_market["leaders"], pykrx_market["leaders"])
+        breadth = self._prefer_market_detail(kis_market["breadth"], pykrx_market["breadth"])
         return {
             "market_summary": {
                 "structure": self._macro_structure_text(fred),
@@ -966,26 +984,26 @@ class ReportDataBuilder:
                 "analysis": self._fx_gold_analysis(fred["usdkrw"], gold),
             },
             "korea_market": {
-                "kospi": self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
-                "kosdaq": self._prefer_values(kis_market["kosdaq"], krx_market.get("kosdaq", DATA_MISSING)),
-                "leaders": kis_market["leaders"],
-                "breadth": kis_market["breadth"],
+                "kospi": kospi_value,
+                "kosdaq": kosdaq_value,
+                "leaders": leaders,
+                "breadth": breadth,
             },
             "flow": {
-                "foreign": kis_market["foreign"],
-                "institutional": kis_market["institutional"],
-                "retail": kis_market["retail"],
-                "analysis": kis_market["analysis"],
+                "foreign": foreign_flow,
+                "institutional": institutional_flow,
+                "retail": retail_flow,
+                "analysis": flow_analysis,
             },
             "flow_rankings": flow_rankings,
             "missing_reasons": {
                 "korea_index": self._compose_korea_index_reason(
-                    self._prefer_values(kis_market["kospi"], krx_market["kospi"]),
-                    self._prefer_values(kis_market["kosdaq"], krx_market.get("kosdaq", DATA_MISSING)),
+                    kospi_value,
+                    kosdaq_value,
                     krx_market["korea_index_reason"],
-                    kis_market["korea_index_reason"],
+                    self._prefer_values(kis_market["korea_index_reason"], pykrx_market["korea_index_reason"]),
                 ),
-                "investor_flow": kis_market["investor_flow_reason"],
+                "investor_flow": investor_flow_reason,
                 "flow_rankings": flow_rankings["reason"],
                 "korea_reference_date": korea_ref_date.isoformat(),
             },
@@ -1131,6 +1149,56 @@ class ReportDataBuilder:
             "korea_index_reason": self._compose_korea_index_reason(kospi_value, kosdaq_value, kospi_reason, kosdaq_reason),
         }
 
+    def _build_pykrx_market_data(self, target_date: date) -> dict[str, str]:
+        result = {
+            "kospi": DATA_MISSING,
+            "kosdaq": DATA_MISSING,
+            "leaders": DATA_MISSING,
+            "breadth": DATA_MISSING,
+            "foreign": DATA_MISSING,
+            "institutional": DATA_MISSING,
+            "retail": DATA_MISSING,
+            "analysis": DATA_MISSING,
+            "korea_index_reason": DATA_MISSING,
+            "investor_flow_reason": DATA_MISSING,
+        }
+        if pykrx_stock is None:
+            result["korea_index_reason"] = "pykrx 미설치"
+            result["investor_flow_reason"] = "pykrx 미설치"
+            return result
+
+        reasons: list[str] = []
+        for days_back in range(0, 7):
+            query_dt = target_date - timedelta(days=days_back)
+            query_date = query_dt.strftime("%Y%m%d")
+            try:
+                kospi_index = pykrx_stock.get_index_ohlcv_by_date(query_date, query_date, "1001")
+                kosdaq_index = pykrx_stock.get_index_ohlcv_by_date(query_date, query_date, "2001")
+                kospi_tickers = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSPI")
+                kosdaq_tickers = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSDAQ")
+            except Exception as error:
+                reasons.append(f"{query_date} PyKRX 시장 데이터: {error}")
+                continue
+
+            result["kospi"] = self._format_pykrx_index_df(kospi_index)
+            result["kosdaq"] = self._format_pykrx_index_df(kosdaq_index)
+            result["leaders"] = self._pykrx_leaders_text(kospi_tickers, kosdaq_tickers)
+            result["breadth"] = self._pykrx_breadth_text(kospi_tickers, kosdaq_tickers)
+
+            flow = self._pykrx_market_flow_summary(query_date)
+            result.update(flow)
+            if result["kospi"] != DATA_MISSING or result["kosdaq"] != DATA_MISSING:
+                if result["kospi"] == DATA_MISSING or result["kosdaq"] == DATA_MISSING:
+                    result["korea_index_reason"] = "PyKRX 일부 지수 데이터 미수집"
+                if result["foreign"] == DATA_MISSING and result["institutional"] == DATA_MISSING and result["retail"] == DATA_MISSING:
+                    result["investor_flow_reason"] = flow.get("investor_flow_reason", "PyKRX 투자주체 수급 미수집")
+                return result
+
+        reason = "; ".join(reasons[:4]) if reasons else "최근 7영업일 내 PyKRX 시장 데이터 미수집"
+        result["korea_index_reason"] = reason
+        result["investor_flow_reason"] = reason
+        return result
+
     def _build_kis_market_data(self) -> dict[str, str]:
         kis = CONFIG["api"]["kis"]
         if not self.client.kis_enabled():
@@ -1233,7 +1301,7 @@ class ReportDataBuilder:
     def _build_pykrx_flow_rankings(self, target_date: date) -> dict[str, Any]:
         result: dict[str, Any] = {
             "as_of": target_date.isoformat(),
-            "source": "PyKRX",
+            "source": "PyKRX(KRX 정규시장 기준, 시간외/NXT 미포함 가능)",
             "amount_unit": "백만원",
             "quantity_unit": "주",
             "volume_unit": "주",
@@ -1260,16 +1328,27 @@ class ReportDataBuilder:
                 reasons.append(f"{query_date} 기초데이터: {error}")
                 continue
 
+            try:
+                kospi_retail = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSPI", "개인")
+            except Exception as error:
+                reasons.append(f"{query_date} KOSPI 개인: {error}")
+                kospi_retail = None
+            try:
+                kosdaq_retail = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSDAQ", "개인")
+            except Exception as error:
+                reasons.append(f"{query_date} KOSDAQ 개인: {error}")
+                kosdaq_retail = None
+
             market_specs = (
-                ("KOSPI", "외국인", "kospi_foreign_buy", "kospi_foreign_sell", kospi_volume, kospi_fund),
-                ("KOSDAQ", "외국인", "kosdaq_foreign_buy", "kosdaq_foreign_sell", kosdaq_volume, kosdaq_fund),
-                ("KOSPI", "기관합계", "kospi_institutional_buy", "kospi_institutional_sell", kospi_volume, kospi_fund),
-                ("KOSDAQ", "기관합계", "kosdaq_institutional_buy", "kosdaq_institutional_sell", kosdaq_volume, kosdaq_fund),
+                ("KOSPI", "외국인", "kospi_foreign_buy", "kospi_foreign_sell", kospi_volume, kospi_fund, kospi_retail),
+                ("KOSDAQ", "외국인", "kosdaq_foreign_buy", "kosdaq_foreign_sell", kosdaq_volume, kosdaq_fund, kosdaq_retail),
+                ("KOSPI", "기관합계", "kospi_institutional_buy", "kospi_institutional_sell", kospi_volume, kospi_fund, kospi_retail),
+                ("KOSDAQ", "기관합계", "kosdaq_institutional_buy", "kosdaq_institutional_sell", kosdaq_volume, kosdaq_fund, kosdaq_retail),
             )
 
             day_reasons: list[str] = []
             day_markets: dict[str, list[dict[str, str]]] = {}
-            for market, investor, buy_key, sell_key, volume_df, fund_df in market_specs:
+            for market, investor, buy_key, sell_key, volume_df, fund_df, retail_df in market_specs:
                 try:
                     ranking_df = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, market, investor)
                 except Exception as error:
@@ -1279,8 +1358,8 @@ class ReportDataBuilder:
                     day_reasons.append(f"{market} {investor}: 빈 응답")
                     continue
 
-                buy_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, positive=True)
-                sell_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, positive=False)
+                buy_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, retail_df, positive=True)
+                sell_rows = self._normalize_pykrx_ranking_df(ranking_df, volume_df, fund_df, retail_df, positive=False)
                 if buy_rows:
                     day_markets[buy_key] = buy_rows
                 if sell_rows:
@@ -1304,6 +1383,7 @@ class ReportDataBuilder:
         ranking_df: Any,
         volume_df: Any,
         fundamental_df: Any,
+        retail_df: Any,
         *,
         positive: bool,
     ) -> list[dict[str, str]]:
@@ -1330,17 +1410,52 @@ class ReportDataBuilder:
                 fund_row = fundamental_df.loc[ticker]
                 per_text = self._fmt_krx_metric(fund_row.get("PER"))
                 pbr_text = self._fmt_krx_metric(fund_row.get("PBR"))
+            retail_quantities = self._pykrx_retail_quantity_fields(retail_df, ticker)
             rows.append(
                 {
                     "name": str(row.get(name_column, DATA_MISSING)),
                     "amount": self._fmt_krx_int(int(abs(row.get(amount_column, 0)) / 1_000_000)),
                     "investor_quantity": self._fmt_krx_int(abs(int(row.get(quantity_column, 0)))),
+                    "retail_buy_quantity": retail_quantities["retail_buy_quantity"],
+                    "retail_sell_quantity": retail_quantities["retail_sell_quantity"],
                     "total_volume": total_volume,
                     "per": per_text,
                     "pbr": pbr_text,
                 }
             )
         return rows
+
+    def _pykrx_retail_quantity_fields(self, retail_df: Any, ticker: str) -> dict[str, str]:
+        result = {
+            "retail_buy_quantity": DATA_MISSING,
+            "retail_sell_quantity": DATA_MISSING,
+        }
+        if retail_df is None or ticker not in getattr(retail_df, "index", []):
+            return result
+
+        row = retail_df.loc[ticker]
+        buy_quantity = row.get("매수거래량") if "매수거래량" in getattr(retail_df, "columns", []) else None
+        sell_quantity = row.get("매도거래량") if "매도거래량" in getattr(retail_df, "columns", []) else None
+        if buy_quantity is not None:
+            result["retail_buy_quantity"] = self._fmt_krx_int(buy_quantity)
+        if sell_quantity is not None:
+            result["retail_sell_quantity"] = self._fmt_krx_int(sell_quantity)
+        if buy_quantity is not None or sell_quantity is not None:
+            return result
+
+        net_quantity = row.get("순매수거래량") if "순매수거래량" in getattr(retail_df, "columns", []) else None
+        if net_quantity is None:
+            return result
+        net_quantity_int = _parse_int_like(net_quantity)
+        if net_quantity_int is None:
+            return result
+        if net_quantity_int >= 0:
+            result["retail_buy_quantity"] = self._fmt_krx_int(net_quantity_int)
+            result["retail_sell_quantity"] = "0"
+        else:
+            result["retail_buy_quantity"] = "0"
+            result["retail_sell_quantity"] = self._fmt_krx_int(abs(net_quantity_int))
+        return result
 
     def _dart_financial_report_candidates(self, target_date: date) -> list[tuple[int, str, str]]:
         year = target_date.year
@@ -1481,6 +1596,7 @@ class ReportDataBuilder:
         company_name = company["name"]
         kis_data = self._build_kis_hyundai_data() if company_name == "현대차" else self._empty_stock_flow_data()
         krx_data = self._build_krx_stock_data(company, target_date)
+        pykrx_data = self._build_pykrx_stock_data(company, target_date)
         company_disclosures = disclosures.get("items_by_company", {}).get(company_name, [])
         dart_financial = self._build_company_dart_financial_snapshot(company, target_date)
         capital_policy_summary, capital_policy_view = self._capital_policy_summary(company_name, company_disclosures)
@@ -1509,6 +1625,15 @@ class ReportDataBuilder:
             latest_high = yahoo_points["latest_high"] or latest_high
             latest_low = yahoo_points["latest_low"] or latest_low
             latest_volume = yahoo_points["latest_volume"] or latest_volume
+        if pykrx_data.get("closes"):
+            closes = pykrx_data["closes"]
+            highs = pykrx_data["highs"]
+            lows = pykrx_data["lows"]
+            latest_close = pykrx_data.get("latest_close") or latest_close
+            prev_close = pykrx_data.get("prev_close") or prev_close
+            latest_high = pykrx_data.get("latest_high") or latest_high
+            latest_low = pykrx_data.get("latest_low") or latest_low
+            latest_volume = pykrx_data.get("latest_volume") or latest_volume
         current_price, prev_close, current_volume, intraday_high, intraday_low = self._merge_stock_price_inputs(
             kis_data,
             krx_data,
@@ -1525,17 +1650,17 @@ class ReportDataBuilder:
         data = {
             "name": company_name,
             "symbol": symbol or DATA_MISSING,
-            "current_close": self._prefer_values(kis_data["current_close"], krx_data["current_close"], _fmt_number(current_price)),
-            "previous_close": self._prefer_values(kis_data["previous_close"], krx_data["previous_close"], _fmt_number(prev_close)),
-            "volume": self._prefer_values(kis_data["volume"], krx_data["volume"], _fmt_int(current_volume)),
+            "current_close": self._prefer_values(kis_data["current_close"], krx_data["current_close"], pykrx_data["current_close"], _fmt_number(current_price)),
+            "previous_close": self._prefer_values(kis_data["previous_close"], krx_data["previous_close"], pykrx_data["previous_close"], _fmt_number(prev_close)),
+            "volume": self._prefer_values(kis_data["volume"], krx_data["volume"], pykrx_data["volume"], _fmt_int(current_volume)),
             "week52_high": _fmt_number(max(highs[:252]) if highs else None),
             "week52_low": _fmt_number(min(lows[:252]) if lows else None),
-            "per": _fmt_ratio(self._yahoo_quote_metric(yahoo_summary, "trailingPE")),
+            "per": self._prefer_values(pykrx_data["per"], _fmt_ratio(self._yahoo_quote_metric(yahoo_summary, "trailingPE"))),
             "forward_per": _fmt_ratio(self._yahoo_quote_metric(yahoo_summary, "forwardPE")),
-            "intraday_high_low": self._prefer_values(kis_data["intraday_high_low"], krx_data["intraday_high_low"], self._combine_values(intraday_high, intraday_low)),
-            "foreign_flow": kis_data["foreign_flow"],
-            "institutional_flow": kis_data["institutional_flow"],
-            "retail_flow": kis_data["retail_flow"],
+            "intraday_high_low": self._prefer_values(kis_data["intraday_high_low"], krx_data["intraday_high_low"], pykrx_data["intraday_high_low"], self._combine_values(intraday_high, intraday_low)),
+            "foreign_flow": self._prefer_values(kis_data["foreign_flow"], pykrx_data["foreign_flow"]),
+            "institutional_flow": self._prefer_values(kis_data["institutional_flow"], pykrx_data["institutional_flow"]),
+            "retail_flow": self._prefer_values(kis_data["retail_flow"], pykrx_data["retail_flow"]),
             "short_selling": self._prefer_values(kis_data["short_selling"], krx_data["short_selling"]),
             "forced_liquidation": kis_data["forced_liquidation"],
             "ma5": _fmt_number(_rolling_average(closes, 5)),
@@ -1610,6 +1735,122 @@ class ReportDataBuilder:
             "intraday_high_low": DATA_MISSING,
             "short_selling": DATA_MISSING,
         }
+
+    def _build_pykrx_stock_data(self, company: dict[str, Any], target_date: date) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "current_close": DATA_MISSING,
+            "previous_close": DATA_MISSING,
+            "volume": DATA_MISSING,
+            "intraday_high_low": DATA_MISSING,
+            "foreign_flow": DATA_MISSING,
+            "institutional_flow": DATA_MISSING,
+            "retail_flow": DATA_MISSING,
+            "short_selling": DATA_MISSING,
+            "per": DATA_MISSING,
+            "pbr": DATA_MISSING,
+            "highs": [],
+            "lows": [],
+            "closes": [],
+            "latest_close": None,
+            "prev_close": None,
+            "latest_high": None,
+            "latest_low": None,
+            "latest_volume": None,
+        }
+        stock_code = str(company.get("stock_code") or "").strip()
+        market = str(company.get("market") or "KOSPI").upper()
+        if pykrx_stock is None or not stock_code:
+            return result
+
+        start_date = (target_date - timedelta(days=420)).strftime("%Y%m%d")
+        end_date = target_date.strftime("%Y%m%d")
+        try:
+            ohlcv = pykrx_stock.get_market_ohlcv_by_date(start_date, end_date, stock_code)
+        except Exception:
+            ohlcv = None
+        if ohlcv is not None and not getattr(ohlcv, "empty", True):
+            ordered = ohlcv.sort_index(ascending=False)
+            latest = ordered.iloc[0]
+            prev = ordered.iloc[1] if len(ordered) > 1 else None
+            close = _safe_float(str(latest.get("종가", "")).replace(",", ""))
+            high = _safe_float(str(latest.get("고가", "")).replace(",", ""))
+            low = _safe_float(str(latest.get("저가", "")).replace(",", ""))
+            volume = _parse_int_like(str(latest.get("거래량", "")))
+            prev_close = _safe_float(str(prev.get("종가", "")).replace(",", "")) if prev is not None else None
+            result.update(
+                {
+                    "current_close": _fmt_number(close),
+                    "previous_close": _fmt_number(prev_close),
+                    "volume": _fmt_int(volume),
+                    "intraday_high_low": self._combine_values(high, low),
+                    "highs": [
+                        value for value in (_safe_float(str(item).replace(",", "")) for item in ordered.get("고가", [])) if value is not None
+                    ],
+                    "lows": [
+                        value for value in (_safe_float(str(item).replace(",", "")) for item in ordered.get("저가", [])) if value is not None
+                    ],
+                    "closes": [
+                        value for value in (_safe_float(str(item).replace(",", "")) for item in ordered.get("종가", [])) if value is not None
+                    ],
+                    "latest_close": close,
+                    "prev_close": prev_close,
+                    "latest_high": high,
+                    "latest_low": low,
+                    "latest_volume": volume,
+                }
+            )
+
+        try:
+            fundamental = pykrx_stock.get_market_fundamental_by_date(start_date, end_date, stock_code)
+        except Exception:
+            fundamental = None
+        if fundamental is not None and not getattr(fundamental, "empty", True):
+            fund_row = fundamental.sort_index(ascending=False).iloc[0]
+            result["per"] = self._fmt_krx_metric(fund_row.get("PER"))
+            result["pbr"] = self._fmt_krx_metric(fund_row.get("PBR"))
+
+        result.update(self._pykrx_stock_flow_fields(start_date, end_date, stock_code, market))
+        return result
+
+    def _pykrx_stock_flow_fields(self, start_date: str, end_date: str, stock_code: str, market: str) -> dict[str, str]:
+        output = {
+            "foreign_flow": DATA_MISSING,
+            "institutional_flow": DATA_MISSING,
+            "retail_flow": DATA_MISSING,
+        }
+        if pykrx_stock is None:
+            return output
+        try:
+            flow_df = pykrx_stock.get_market_trading_volume_by_date(start_date, end_date, stock_code)
+        except Exception:
+            flow_df = None
+        if flow_df is not None and not getattr(flow_df, "empty", True):
+            latest = flow_df.sort_index(ascending=False).iloc[0]
+            output["foreign_flow"] = self._stock_flow_text("외국인", self._pykrx_stock_flow_value(latest, "외국인합계", "외국인"))
+            output["institutional_flow"] = self._stock_flow_text("기관", self._pykrx_stock_flow_value(latest, "기관합계", "기관"))
+            output["retail_flow"] = self._stock_flow_text("개인", self._pykrx_stock_flow_value(latest, "개인"))
+            return output
+
+        try:
+            market_flow = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(end_date, end_date, market, "개인")
+        except Exception:
+            market_flow = None
+        if market_flow is not None and not getattr(market_flow, "empty", True) and stock_code in getattr(market_flow, "index", []):
+            row = market_flow.loc[stock_code]
+            output["retail_flow"] = self._stock_flow_text("개인", _parse_int_like(str(row.get("순매수거래량"))))
+        return output
+
+    def _pykrx_stock_flow_value(self, row: Any, *columns: str) -> int | None:
+        for column in columns:
+            if column in getattr(row, "index", []):
+                return _parse_int_like(str(row.get(column)))
+        return None
+
+    def _stock_flow_text(self, label: str, quantity: int | None) -> str:
+        if quantity is None:
+            return DATA_MISSING
+        direction = "순매수" if quantity >= 0 else "순매도"
+        return f"{label} {direction} {_fmt_int(abs(quantity))}주"
 
     def _build_favorite_stocks(
         self,
@@ -1926,7 +2167,7 @@ class ReportDataBuilder:
                 return symbol
         return None
 
-    def _build_sector_data(self, target_date: date) -> dict[str, dict[str, str]]:
+    def _build_sector_data(self, target_date: date, session: str) -> dict[str, dict[str, str]]:
         sector_data: dict[str, dict[str, str]] = {}
         for sector, query in self.news_queries.items():
             marketaux_query = MARKETAUX_SEARCH_QUERIES.get(sector, query)
@@ -1939,6 +2180,7 @@ class ReportDataBuilder:
                 massive_ticker=massive_ticker,
             )
             top = self._select_relevant_article(sector, articles)
+            self._log_news_quality(target_date, session, sector, articles, top)
             localized_title = self._localize_headline(sector, top.title if top else DATA_MISSING)
             localized_description = self._localize_description(sector, localized_title, top.description if top else DATA_MISSING)
             schedule = self._build_sector_schedule(sector, target_date)
@@ -2036,6 +2278,71 @@ class ReportDataBuilder:
         if self._relevance_score(top, keywords) < min_score:
             return None
         return top
+
+    def _log_news_quality(
+        self,
+        target_date: date,
+        session: str,
+        sector: str,
+        articles: list[NewsItem],
+        selected: NewsItem | None,
+    ) -> None:
+        if not articles:
+            return
+        NEWS_QUALITY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        keywords = NEWS_RELEVANCE_KEYWORDS.get(sector, [])
+        selected_key = self._news_quality_key(selected) if selected else None
+        generated_at = datetime.now().astimezone().isoformat()
+        with NEWS_QUALITY_LOG.open("a", encoding="utf-8") as file:
+            for article in articles:
+                low_quality = self._is_low_quality_article(article, sector)
+                allowed_source = self._is_allowed_source(article, sector)
+                score = self._relevance_score(article, keywords)
+                selected_article = selected_key is not None and self._news_quality_key(article) == selected_key
+                record = {
+                    "generated_at": generated_at,
+                    "report_date": target_date.isoformat(),
+                    "session": session,
+                    "sector": sector,
+                    "provider": article.provider,
+                    "source": article.source,
+                    "published_at": article.published_at,
+                    "title": article.title,
+                    "url": article.url,
+                    "relevance_score": score,
+                    "selected": selected_article,
+                    "allowed_source": allowed_source,
+                    "low_quality": low_quality,
+                    "rejection_reason": self._news_rejection_reason(article, sector, score, selected_article, low_quality, allowed_source),
+                }
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _news_quality_key(self, article: NewsItem | None) -> tuple[str, str] | None:
+        if article is None:
+            return None
+        return ((article.url or "").strip().lower(), (article.title or "").strip().lower())
+
+    def _news_rejection_reason(
+        self,
+        article: NewsItem,
+        sector: str,
+        score: int,
+        selected: bool,
+        low_quality: bool,
+        allowed_source: bool,
+    ) -> str:
+        if selected:
+            return ""
+        if low_quality:
+            return "low_quality"
+        if not allowed_source and not self._is_fallback_news_mode():
+            return "source_not_allowed"
+        min_score = 0 if self._is_fallback_news_mode() else 1
+        if score < min_score:
+            return "score_below_threshold"
+        if self._is_fallback_news_mode() and not self._is_fallback_candidate(article, sector):
+            return "fallback_keyword_mismatch"
+        return "not_top_ranked"
 
     def _is_fallback_news_mode(self) -> bool:
         return self.client.marketaux_rate_limited or self.client.massive_rate_limited
@@ -2383,9 +2690,10 @@ class ReportDataBuilder:
         krx_ok = "연결됨" if common["korea_market"]["kospi"] != DATA_MISSING else ("권한 오류" if self.client.krx_key and self.client.krx_last_error else "미연결")
         kis_key_name = self.api_config["kis"]["enabled_env"]
         kis_secret_name = self.api_config["kis"]["app_secret_env"]
-        kis_ok = "준비됨" if os.getenv(kis_key_name) and os.getenv(kis_secret_name) else "미연결"
+        pykrx_flow_ok = any(common.get("flow", {}).get(key) != DATA_MISSING for key in ("foreign", "institutional", "retail"))
+        kis_ok = "준비됨" if os.getenv(kis_key_name) and os.getenv(kis_secret_name) else ("PyKRX 대체 연결" if pykrx_flow_ok else "미연결")
         if hyundai.get("current_close") != DATA_MISSING and hyundai.get("volume") != DATA_MISSING:
-            hyundai_reason = "KRX 일별매매정보로 현대차 종가·고가·저가·거래량은 연결됨. 투자자 수급·공매도는 추가 API 필요"
+            hyundai_reason = "PyKRX/KRX 정규시장 일별매매정보로 현대차 종가·고가·저가·거래량·이동평균은 연결됨. 시간외/NXT·공매도·반대매매는 추가 소스 필요"
         elif self.client.krx_key and self.client.krx_last_error:
             hyundai_reason = f"KRX_API_KEY는 설정됐지만 현대차 개별종목 API 응답이 불완전함. KRX 최근 오류: {self.client.krx_last_error}"
         elif alpha_ok != "미연결":
@@ -2402,7 +2710,11 @@ class ReportDataBuilder:
             "krx_status": krx_ok,
             "kis_status": kis_ok,
             "krx_reason": common["missing_reasons"]["korea_index"],
-            "kis_reason": f"{kis_key_name} 또는 {kis_secret_name} 환경변수 미설정으로 한국장 지수/수급 미수집" if kis_ok == "미연결" else "KIS 키는 준비됨. 엔드포인트 경로와 응답 파싱 로직 연결 필요",
+            "kis_reason": DATA_MISSING if pykrx_flow_ok else (
+                f"{kis_key_name} 또는 {kis_secret_name} 환경변수 미설정으로 한국장 지수/수급 미수집"
+                if kis_ok == "미연결"
+                else "KIS 키는 준비됨. 엔드포인트 경로와 응답 파싱 로직 연결 필요"
+            ),
             "hyundai_reason": hyundai_reason,
             "flow_reason": common["missing_reasons"].get("flow_rankings") or "KRX 투자주체 수급 상위 연결됨",
             "news_reason": "뉴스는 수집되지만 국내 관련 종목 가격 반응 데이터가 없어 정량 영향 평가는 제한적임",
@@ -3023,15 +3335,25 @@ class ReportDataBuilder:
     ) -> list[dict[str, str]]:
         selected: list[dict[str, str]] = []
         seen: set[str] = set()
+        reference_date = self._common_reference_date(common)
         for sector in self._preferred_stock_sectors(common, sectors):
             for name in AUTO_STOCK_CANDIDATES.get(sector, []):
                 if name in seen:
                     continue
-                selected.append(self._build_stock_candidate(name, sector, sectors, disclosures))
+                selected.append(self._build_stock_candidate(name, sector, sectors, disclosures, reference_date))
                 seen.add(name)
                 if len(selected) == 3:
                     return selected
         return selected
+
+    def _common_reference_date(self, common: dict[str, Any]) -> date:
+        raw = common.get("missing_reasons", {}).get("korea_reference_date")
+        if isinstance(raw, str):
+            try:
+                return date.fromisoformat(raw[:10])
+            except ValueError:
+                pass
+        return date.today()
 
     def _preferred_stock_sectors(self, common: dict[str, Any], sectors: dict[str, dict[str, str]]) -> list[str]:
         preferred: list[str] = []
@@ -3045,35 +3367,74 @@ class ReportDataBuilder:
                 preferred.append(sector)
         return preferred
 
-    def _build_stock_candidate(self, name: str, sector: str, sectors: dict[str, dict[str, str]], disclosures: dict[str, Any]) -> dict[str, str]:
+    def _build_stock_candidate(
+        self,
+        name: str,
+        sector: str,
+        sectors: dict[str, dict[str, str]],
+        disclosures: dict[str, Any],
+        target_date: date,
+    ) -> dict[str, str]:
         sector_data = sectors.get(sector, {})
         headline = sector_data.get("headline", DATA_MISSING)
         disclosure = self._latest_company_disclosure(name, disclosures)
-        target_snapshot = self._stock_target_snapshot(name)
+        stock_snapshot = self._candidate_pykrx_snapshot(name, target_date)
+        current = stock_snapshot["current"]
+        ma20 = stock_snapshot["ma20"]
+        ma60 = stock_snapshot["ma60"]
+        target_snapshot = self._stock_target_snapshot(name, current)
         reason_parts = [f"{sector} 우선 관찰"]
         if headline != DATA_MISSING:
             reason_parts.append(f"섹터 뉴스: {headline}")
         if disclosure != DATA_MISSING:
             reason_parts.append(f"최근 공시: {disclosure}")
+        if stock_snapshot["summary"] != DATA_MISSING:
+            reason_parts.append(stock_snapshot["summary"])
         if len(reason_parts) == 1:
             reason_parts.append("개별 종목 자동 선별 근거 데이터 부족")
         return {
             "name": name,
             "sector": sector,
             "reason": " | ".join(reason_parts),
-            "entry": self._generic_stock_entry_rule(name, sector, headline, disclosure),
-            "add": self._generic_stock_add_rule(name, disclosure),
-            "exit": f"{name} 손절/탈출 기준은 데이터 미수집 (개별 종목 가격·거래량 API 미연동)",
+            "entry": self._generic_stock_entry_rule(name, sector, headline, disclosure, current, ma20),
+            "add": self._candidate_add_rule(name, current, ma20, disclosure),
+            "exit": self._favorite_exit_rule(current, ma20, name),
             "invalid": self._generic_stock_invalid_rule(sector, headline, disclosure),
-            "chart": self._generic_stock_chart_view(name, sector, headline, disclosure),
-            "shakeout": self._generic_stock_shakeout_view(name, headline, disclosure),
-            "down_reason": self._generic_stock_down_reason(name, sector, headline, disclosure),
-            "up_reason": self._generic_stock_up_reason(name, sector, headline, disclosure),
-            "forecast": self._generic_stock_forecast(name, sector, headline, disclosure),
+            "chart": self._candidate_chart_view(name, sector, headline, disclosure, current, ma20, ma60),
+            "shakeout": self._shakeout_view(current, ma20, ma60, name),
+            "down_reason": self._favorite_down_reason(current, ma20, ma60, disclosure, name),
+            "up_reason": self._favorite_up_reason(current, ma20, ma60, disclosure, name),
+            "forecast": self._favorite_forecast(current, ma20, ma60, name),
             "target_price": target_snapshot["target_price"],
             "target_price_view": target_snapshot["target_price_view"],
             "target_price_basis": target_snapshot["target_price_basis"],
         }
+
+    def _candidate_pykrx_snapshot(self, name: str, target_date: date) -> dict[str, Any]:
+        metadata = self._company_metadata(name)
+        if not metadata:
+            return {"summary": DATA_MISSING, "current": None, "ma20": None, "ma60": None}
+        data = self._build_pykrx_stock_data(metadata, target_date)
+        current = data.get("latest_close")
+        closes = data.get("closes") or []
+        ma20 = _rolling_average(closes, 20)
+        ma60 = _rolling_average(closes, 60)
+        if current is None:
+            return {"summary": DATA_MISSING, "current": None, "ma20": ma20, "ma60": ma60}
+        summary_parts = [f"종가 {_fmt_number(current)}"]
+        if data.get("volume") != DATA_MISSING:
+            summary_parts.append(f"거래량 {data['volume']}")
+        if ma20 is not None:
+            summary_parts.append(f"20일선 {_fmt_number(ma20)}")
+        return {"summary": " | ".join(summary_parts), "current": current, "ma20": ma20, "ma60": ma60}
+
+    def _company_metadata(self, name: str) -> dict[str, Any] | None:
+        for company in self.tracked_companies:
+            if company.get("name") == name:
+                return dict(company)
+        if name in EXTRA_COMPANY_METADATA:
+            return {"name": name, **EXTRA_COMPANY_METADATA[name]}
+        return None
 
     def _latest_company_disclosure(self, company_name: str, disclosures: dict[str, Any]) -> str:
         items = disclosures.get("items_by_company", {}).get(company_name, [])
@@ -3082,7 +3443,19 @@ class ReportDataBuilder:
         latest = items[0]
         return f"{latest.report_name} ({latest.filed_at})"
 
-    def _generic_stock_entry_rule(self, name: str, sector: str, headline: str, disclosure: str) -> str:
+    def _generic_stock_entry_rule(
+        self,
+        name: str,
+        sector: str,
+        headline: str,
+        disclosure: str,
+        current: float | None = None,
+        ma20: float | None = None,
+    ) -> str:
+        if current is not None and ma20 is not None:
+            if current >= ma20:
+                return f"{name} 진입 기준: 20일선({_fmt_number(ma20)}) 위에서 거래량 유지 시 분할 접근."
+            return f"{name} 진입 기준: 20일선({_fmt_number(ma20)}) 회복 확인 전 추격 보류."
         if headline != DATA_MISSING or disclosure != DATA_MISSING:
             return f"{name} 진입 기준은 데이터 미수집 (개별 가격·거래량 API 미연동). 현재는 {sector} 뉴스/공시 확인 후 수동 판단 필요."
         return f"{name} 진입 기준은 데이터 미수집 (섹터 근거와 개별 시세 데이터 모두 부족)"
@@ -3098,6 +3471,25 @@ class ReportDataBuilder:
         if headline != DATA_MISSING:
             return f"{sector} 뉴스 방향이 바뀌거나 후속 기사로 반박되면 시나리오 무효"
         return "시나리오 무효화 조건은 데이터 미수집 (개별 근거 부족)"
+
+    def _candidate_add_rule(self, name: str, current: float | None, ma20: float | None, disclosure: str) -> str:
+        if current is not None and ma20 is not None:
+            return self._favorite_add_rule(current, ma20, name)
+        return self._generic_stock_add_rule(name, disclosure)
+
+    def _candidate_chart_view(
+        self,
+        name: str,
+        sector: str,
+        headline: str,
+        disclosure: str,
+        current: float | None,
+        ma20: float | None,
+        ma60: float | None,
+    ) -> str:
+        if current is not None and ma20 is not None and ma60 is not None:
+            return self._favorite_chart_structure(current, ma20, ma60, name)
+        return self._generic_stock_chart_view(name, sector, headline, disclosure)
 
     def _generic_stock_chart_view(self, name: str, sector: str, headline: str, disclosure: str) -> str:
         if headline != DATA_MISSING and disclosure != DATA_MISSING:
@@ -3180,6 +3572,26 @@ class ReportDataBuilder:
                     "QTY",
                 )
             ),
+            "retail_buy_quantity": self._fmt_krx_int(
+                self._krx_row_value(
+                    row,
+                    "INDV_BUY_QTY",
+                    "INDV_BID_QTY",
+                    "PRSN_BUY_QTY",
+                    "RETAIL_BUY_QTY",
+                    "PERSONAL_BUY_QTY",
+                )
+            ),
+            "retail_sell_quantity": self._fmt_krx_int(
+                self._krx_row_value(
+                    row,
+                    "INDV_SELL_QTY",
+                    "INDV_ASK_QTY",
+                    "PRSN_SELL_QTY",
+                    "RETAIL_SELL_QTY",
+                    "PERSONAL_SELL_QTY",
+                )
+            ),
             "total_volume": self._fmt_krx_int(self._krx_row_value(row, "ACC_TRDVOL", "TDD_TRDVOL", "TRDVOL")),
             "per": self._fmt_krx_metric(self._krx_row_value(row, "PER", "TDD_PER", "PR_RATIO")),
             "pbr": self._fmt_krx_metric(self._krx_row_value(row, "PBR", "TDD_PBR", "PBR_RATIO")),
@@ -3239,6 +3651,140 @@ class ReportDataBuilder:
             pieces.append(f"거래대금 {trade_value}")
         return " | ".join(pieces)
 
+    def _format_pykrx_index_df(self, index_df: Any) -> str:
+        if index_df is None or getattr(index_df, "empty", True):
+            return DATA_MISSING
+        row = index_df.iloc[-1]
+        close_value = _safe_float(str(row.get("종가", "")).replace(",", ""))
+        open_value = _safe_float(str(row.get("시가", "")).replace(",", ""))
+        high_value = _safe_float(str(row.get("고가", "")).replace(",", ""))
+        low_value = _safe_float(str(row.get("저가", "")).replace(",", ""))
+        trade_value = _parse_int_like(str(row.get("거래대금", "")))
+        change = close_value - open_value if close_value is not None and open_value is not None else None
+        change_rate = (change / open_value * 100) if change is not None and open_value not in (None, 0) else None
+        pieces = [_fmt_number(close_value)]
+        if change is not None:
+            pieces.append(f"시가대비 {self._fmt_signed_krx_value(change)}")
+        if change_rate is not None:
+            pieces.append(f"등락률 {_fmt_pct(change_rate)}")
+        high_low = self._combine_values(high_value, low_value)
+        if high_low != DATA_MISSING:
+            pieces.append(f"고가/저가 {high_low}")
+        if trade_value is not None:
+            pieces.append(f"거래대금 {_fmt_int(int(trade_value / 1_000_000))}백만원")
+        return " | ".join(pieces)
+
+    def _pykrx_breadth_text(self, kospi_df: Any, kosdaq_df: Any) -> str:
+        parts: list[str] = []
+        for market_name, df in (("코스피", kospi_df), ("코스닥", kosdaq_df)):
+            if df is None or getattr(df, "empty", True) or "등락률" not in getattr(df, "columns", []):
+                continue
+            up_count = int((df["등락률"] > 0).sum())
+            down_count = int((df["등락률"] < 0).sum())
+            flat_count = int((df["등락률"] == 0).sum())
+            parts.append(f"{market_name} 상승 {up_count} / 하락 {down_count} / 보합 {flat_count}")
+        return " | ".join(parts) if parts else DATA_MISSING
+
+    def _pykrx_leaders_text(self, kospi_df: Any, kosdaq_df: Any) -> str:
+        candidates: list[tuple[float, str, str]] = []
+        for market_name, df in (("코스피", kospi_df), ("코스닥", kosdaq_df)):
+            if df is None or getattr(df, "empty", True):
+                continue
+            amount_column = "거래대금" if "거래대금" in getattr(df, "columns", []) else None
+            change_column = "등락률" if "등락률" in getattr(df, "columns", []) else None
+            if not amount_column:
+                continue
+            top_df = df.sort_values(amount_column, ascending=False).head(3)
+            for ticker, row in top_df.iterrows():
+                amount = _safe_float(str(row.get(amount_column, "")).replace(",", "")) or 0
+                name = self._pykrx_ticker_name(str(ticker))
+                change = _safe_float(str(row.get(change_column, "")).replace(",", "")) if change_column else None
+                suffix = f" {_fmt_pct(change)}" if change is not None else ""
+                candidates.append((amount, f"{name}({market_name})", suffix))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if not candidates:
+            return DATA_MISSING
+        return "거래대금 상위: " + ", ".join(f"{name}{suffix}" for _, name, suffix in candidates[:5])
+
+    def _pykrx_market_flow_summary(self, query_date: str) -> dict[str, str]:
+        output = {
+            "foreign": DATA_MISSING,
+            "institutional": DATA_MISSING,
+            "retail": DATA_MISSING,
+            "analysis": DATA_MISSING,
+            "investor_flow_reason": DATA_MISSING,
+        }
+        summaries: dict[str, int] = {}
+        reasons: list[str] = []
+        for market in ("KOSPI", "KOSDAQ"):
+            try:
+                volume_df = pykrx_stock.get_market_trading_volume_by_investor(query_date, query_date, market)
+            except Exception as error:
+                reasons.append(f"{market} 투자주체 수급: {error}")
+                continue
+            if volume_df is None or getattr(volume_df, "empty", True):
+                reasons.append(f"{market} 투자주체 수급: 빈 응답")
+                continue
+            for investor_key, label in (("외국인", "foreign"), ("기관합계", "institutional"), ("개인", "retail")):
+                net_quantity = self._pykrx_investor_net_quantity(volume_df, investor_key)
+                if net_quantity is None:
+                    continue
+                summaries[label] = summaries.get(label, 0) + net_quantity
+
+        if summaries:
+            output["foreign"] = self._flow_summary_text("외국인", summaries.get("foreign"))
+            output["institutional"] = self._flow_summary_text("기관", summaries.get("institutional"))
+            output["retail"] = self._flow_summary_text("개인", summaries.get("retail"))
+            output["analysis"] = self._pykrx_flow_analysis(summaries)
+            return output
+        output["investor_flow_reason"] = "; ".join(reasons[:4]) if reasons else "PyKRX 투자주체 수급 데이터 미수집"
+        return output
+
+    def _pykrx_investor_net_quantity(self, volume_df: Any, investor: str) -> int | None:
+        if investor in getattr(volume_df, "index", []):
+            row = volume_df.loc[investor]
+            for column in ("순매수", "순매수거래량", "순매수량"):
+                if column in getattr(volume_df, "columns", []):
+                    return _parse_int_like(str(row.get(column)))
+            buy = _parse_int_like(str(row.get("매수"))) if "매수" in getattr(volume_df, "columns", []) else None
+            sell = _parse_int_like(str(row.get("매도"))) if "매도" in getattr(volume_df, "columns", []) else None
+            if buy is not None and sell is not None:
+                return buy - sell
+        if investor in getattr(volume_df, "columns", []):
+            series = volume_df[investor]
+            value = series.iloc[-1] if hasattr(series, "iloc") else None
+            return _parse_int_like(str(value))
+        return None
+
+    def _flow_summary_text(self, label: str, net_quantity: int | None) -> str:
+        if net_quantity is None:
+            return DATA_MISSING
+        direction = "순매수" if net_quantity >= 0 else "순매도"
+        return f"{label} {direction} {_fmt_int(abs(net_quantity))}주"
+
+    def _pykrx_flow_analysis(self, summaries: dict[str, int]) -> str:
+        foreign = summaries.get("foreign")
+        institutional = summaries.get("institutional")
+        retail = summaries.get("retail")
+        pieces: list[str] = []
+        if foreign is not None and institutional is not None:
+            if foreign > 0 and institutional > 0:
+                pieces.append("외국인과 기관이 동반 순매수해 수급 질은 우호적")
+            elif foreign < 0 and institutional < 0:
+                pieces.append("외국인과 기관이 동반 순매도해 수급 방어력은 약함")
+            else:
+                pieces.append("외국인과 기관 방향이 엇갈려 주도 수급 확인 필요")
+        if retail is not None:
+            pieces.append("개인은 " + ("순매수" if retail >= 0 else "순매도"))
+        return " | ".join(pieces) if pieces else DATA_MISSING
+
+    def _pykrx_ticker_name(self, ticker: str) -> str:
+        try:
+            name = pykrx_stock.get_market_ticker_name(ticker)
+        except Exception:
+            name = ""
+        return name or ticker
+
     def _compose_korea_index_reason(self, kospi_value: str, kosdaq_value: str, kospi_reason: str, kosdaq_reason: str) -> str:
         reasons: list[str] = []
         if kospi_value == DATA_MISSING:
@@ -3290,6 +3836,12 @@ class ReportDataBuilder:
             if value != DATA_MISSING:
                 return value
         return DATA_MISSING
+
+    def _prefer_market_detail(self, primary: str, fallback: str) -> str:
+        placeholder_terms = ("분석 보류", "연결 필요", "엔드포인트 설정", "미설정")
+        if primary != DATA_MISSING and not any(term in primary for term in placeholder_terms):
+            return primary
+        return fallback if fallback != DATA_MISSING else primary
 
     def _favorite_chart_structure(self, current: float | None, ma20: float | None, ma60: float | None, name: str) -> str:
         if current is None or ma20 is None or ma60 is None:

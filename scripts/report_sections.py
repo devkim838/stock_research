@@ -95,6 +95,8 @@ def build_flow_ranking_section(flow_rankings: dict | None = None, missing_reason
                 f"금액 {item.get('amount', DATA_MISSING)}({flow_rankings.get('amount_unit', '단위 미확인')}) | "
                 f"총거래량 {item.get('total_volume', DATA_MISSING)}{flow_rankings.get('volume_unit', '주')} | "
                 f"{subject_label} {item.get('investor_quantity', DATA_MISSING)}({flow_rankings.get('quantity_unit', '단위 미확인')}) | "
+                f"개인매수수량 {item.get('retail_buy_quantity', DATA_MISSING)}({flow_rankings.get('quantity_unit', '단위 미확인')}) | "
+                f"개인매도수량 {item.get('retail_sell_quantity', DATA_MISSING)}({flow_rankings.get('quantity_unit', '단위 미확인')}) | "
                 f"PER {item.get('per', DATA_MISSING)} | "
                 f"PBR {item.get('pbr', DATA_MISSING)}"
             )
