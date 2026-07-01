@@ -37,8 +37,10 @@ load_dotenv(ROOT / ".env")
 
 try:
     from pykrx import stock as pykrx_stock
-except Exception:
+    PYKRX_IMPORT_ERROR = ""
+except Exception as error:
     pykrx_stock = None
+    PYKRX_IMPORT_ERROR = repr(error)
 
 DATA_MISSING = "데이터 미수집"
 ANALYSIS_PENDING = "필수 데이터 부족으로 분석 보류"
@@ -257,6 +259,20 @@ def _load_config() -> dict[str, Any]:
 
 CONFIG = _load_config()
 load_dotenv(ROOT / CONFIG["api"]["dotenv_path"])
+
+
+def _ensure_pykrx_stock() -> Any:
+    global pykrx_stock, PYKRX_IMPORT_ERROR
+    if pykrx_stock is not None:
+        return pykrx_stock
+    try:
+        from pykrx import stock as imported_pykrx_stock
+        pykrx_stock = imported_pykrx_stock
+        PYKRX_IMPORT_ERROR = ""
+    except Exception as error:
+        PYKRX_IMPORT_ERROR = repr(error)
+        pykrx_stock = None
+    return pykrx_stock
 
 
 def _safe_float(value: str | None) -> float | None:
@@ -1308,8 +1324,9 @@ class ReportDataBuilder:
             "markets": {},
             "reason": DATA_MISSING,
         }
-        if pykrx_stock is None:
-            result["reason"] = "pykrx 미설치"
+        stock_client = _ensure_pykrx_stock()
+        if stock_client is None:
+            result["reason"] = f"pykrx 미설치 또는 import 실패: {PYKRX_IMPORT_ERROR or '원인 미상'}"
             return result
         if not os.getenv("KRX_ID") or not os.getenv("KRX_PW"):
             result["reason"] = "PyKRX 투자자 수급 조회에는 KRX_ID, KRX_PW가 필요함"
@@ -1320,21 +1337,21 @@ class ReportDataBuilder:
             query_dt = target_date - timedelta(days=days_back)
             query_date = query_dt.strftime("%Y%m%d")
             try:
-                kospi_volume = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSPI")
-                kosdaq_volume = pykrx_stock.get_market_ohlcv_by_ticker(query_date, "KOSDAQ")
-                kospi_fund = pykrx_stock.get_market_fundamental_by_ticker(query_date, "KOSPI")
-                kosdaq_fund = pykrx_stock.get_market_fundamental_by_ticker(query_date, "KOSDAQ")
+                kospi_volume = stock_client.get_market_ohlcv_by_ticker(query_date, "KOSPI")
+                kosdaq_volume = stock_client.get_market_ohlcv_by_ticker(query_date, "KOSDAQ")
+                kospi_fund = stock_client.get_market_fundamental_by_ticker(query_date, "KOSPI")
+                kosdaq_fund = stock_client.get_market_fundamental_by_ticker(query_date, "KOSDAQ")
             except Exception as error:
                 reasons.append(f"{query_date} 기초데이터: {error}")
                 continue
 
             try:
-                kospi_retail = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSPI", "개인")
+                kospi_retail = stock_client.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSPI", "개인")
             except Exception as error:
                 reasons.append(f"{query_date} KOSPI 개인: {error}")
                 kospi_retail = None
             try:
-                kosdaq_retail = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSDAQ", "개인")
+                kosdaq_retail = stock_client.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, "KOSDAQ", "개인")
             except Exception as error:
                 reasons.append(f"{query_date} KOSDAQ 개인: {error}")
                 kosdaq_retail = None
@@ -1350,7 +1367,7 @@ class ReportDataBuilder:
             day_markets: dict[str, list[dict[str, str]]] = {}
             for market, investor, buy_key, sell_key, volume_df, fund_df, retail_df in market_specs:
                 try:
-                    ranking_df = pykrx_stock.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, market, investor)
+                    ranking_df = stock_client.get_market_net_purchases_of_equities_by_ticker(query_date, query_date, market, investor)
                 except Exception as error:
                     day_reasons.append(f"{market} {investor}: {error}")
                     continue

@@ -14,8 +14,10 @@ from report_sections import (
     build_coverage_section,
     build_hyundai_section,
     build_morning_summary_section,
+    build_morning_top_news_section,
     build_sector_news_sections,
     build_session_specific_section,
+    build_us_proxy_section,
 )
 
 
@@ -69,6 +71,8 @@ def build_content(session: str, target_date: date) -> str:
     report_data = DATA_BUILDER.build(session, target_date)
     session_block = build_session_specific_section(session, SESSION_NOTES[session], report_data)
     summary_block = build_morning_summary_section(report_data) if session == "morning" else None
+    us_proxy_block = build_us_proxy_section(report_data) if session == "morning" else None
+    top_news_block = build_morning_top_news_section(report_data) if session == "morning" else None
     sections = [
         title,
         "",
@@ -83,19 +87,49 @@ def build_content(session: str, target_date: date) -> str:
         "",
         build_coverage_section(report_data),
         "",
-        *( [summary_block, ""] if summary_block else [] ),
-        build_common_sections(report_data),
-        "",
-        build_hyundai_section(report_data),
-        "",
-        session_block,
-        "",
-        "## 섹터별 뉴스 및 투자 판단",
-        "",
-        build_sector_news_sections(report_data),
     ]
-    if session == "closing":
-        sections.extend(["", build_closing_decision_sections(report_data)])
+    if session == "morning":
+        sections.extend(
+            [
+                build_common_sections(report_data),
+                "",
+                *( [summary_block, ""] if summary_block else [] ),
+                *( [us_proxy_block, ""] if us_proxy_block else [] ),
+                *( [top_news_block, ""] if top_news_block else [] ),
+            ]
+        )
+    else:
+        sections.extend(
+            [
+                *( [summary_block, ""] if summary_block else [] ),
+                build_common_sections(report_data),
+                "",
+            ]
+        )
+    if session == "morning":
+        sections.extend(
+            [
+                build_hyundai_section(report_data),
+            ]
+        )
+    elif session == "closing":
+        sections.extend(
+            [
+                build_hyundai_section(report_data),
+            ]
+        )
+    else:
+        sections.extend(
+            [
+                build_hyundai_section(report_data),
+                "",
+                session_block,
+                "",
+                "## 섹터별 뉴스 및 투자 판단",
+                "",
+                build_sector_news_sections(report_data),
+            ]
+        )
     return "\n".join(sections).rstrip() + "\n"
 
 

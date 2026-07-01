@@ -27,6 +27,17 @@ FLOW_RANKING_TITLES = {
     "kosdaq_institutional_sell": "코스닥 기관 순매도 상위 1~10",
 }
 
+FLOW_DUPLICATE_PAIRS = {
+    "kospi_foreign_buy": "kospi_institutional_buy",
+    "kospi_foreign_sell": "kospi_institutional_sell",
+    "kosdaq_foreign_buy": "kosdaq_institutional_buy",
+    "kosdaq_foreign_sell": "kosdaq_institutional_sell",
+    "kospi_institutional_buy": "kospi_foreign_buy",
+    "kospi_institutional_sell": "kospi_foreign_sell",
+    "kosdaq_institutional_buy": "kosdaq_foreign_buy",
+    "kosdaq_institutional_sell": "kosdaq_foreign_sell",
+}
+
 
 def with_missing_reason(value: str, reason: str) -> str:
     if value == DATA_MISSING:
@@ -64,11 +75,35 @@ def stock_label(name: str, sector: str) -> str:
     return f"{name} ({sector})"
 
 
+def _flow_overlap_names(markets: dict[str, list[dict[str, str]]], key: str) -> set[str]:
+    paired_key = FLOW_DUPLICATE_PAIRS.get(key)
+    if not paired_key:
+        return set()
+    current_names = {
+        str(item.get("name", "")).strip()
+        for item in markets.get(key, [])
+        if str(item.get("name", "")).strip() and item.get("name") != DATA_MISSING
+    }
+    paired_names = {
+        str(item.get("name", "")).strip()
+        for item in markets.get(paired_key, [])
+        if str(item.get("name", "")).strip() and item.get("name") != DATA_MISSING
+    }
+    return current_names & paired_names
+
+
+def _highlight_flow_name(name: str, overlaps: set[str]) -> str:
+    clean = str(name or DATA_MISSING).strip() or DATA_MISSING
+    if clean in overlaps:
+        return f"**{clean}**"
+    return clean
+
+
 def build_flow_ranking_section(flow_rankings: dict | None = None, missing_reason: str = DATA_MISSING) -> str:
     flow_rankings = flow_rankings or {}
     markets = flow_rankings.get("markets", {})
     lines = [
-        "## 수급 상위",
+        "## 국내 수급 상위",
         "",
         f"- 기준일: {flow_rankings.get('as_of', DATA_MISSING)}",
         f"- 출처: {flow_rankings.get('source', DATA_MISSING)}",
@@ -88,10 +123,13 @@ def build_flow_ranking_section(flow_rankings: dict | None = None, missing_reason
             lines.append(f"- 데이터 미수집: {missing_reason}")
             lines.append("")
             continue
+        overlaps = _flow_overlap_names(markets, key)
+        if overlaps:
+            lines.append(f"- 중복 종목 표시: {' , '.join(sorted(overlaps))}".replace(" , ", ", "))
         subject_label = "외국인수량" if "foreign" in key else "기관수량"
         for index, item in enumerate(items[:10], start=1):
             lines.append(
-                f"{index}. {item.get('name', DATA_MISSING)} | "
+                f"{index}. {_highlight_flow_name(item.get('name', DATA_MISSING), overlaps)} | "
                 f"금액 {item.get('amount', DATA_MISSING)}({flow_rankings.get('amount_unit', '단위 미확인')}) | "
                 f"총거래량 {item.get('total_volume', DATA_MISSING)}{flow_rankings.get('volume_unit', '주')} | "
                 f"{subject_label} {item.get('investor_quantity', DATA_MISSING)}({flow_rankings.get('quantity_unit', '단위 미확인')}) | "
@@ -104,7 +142,22 @@ def build_flow_ranking_section(flow_rankings: dict | None = None, missing_reason
     return "\n".join(lines).rstrip()
 
 
-def build_top_news_lines(report_data: dict | None = None) -> list[str]:
+def build_us_proxy_section(report_data: dict | None = None) -> str:
+    session_data = (report_data or {}).get("session", {})
+    common = (report_data or {}).get("common", {})
+    market_summary = common.get("market_summary", {})
+    lines = [
+        "## 미장 대체 지표",
+        "",
+        f"- 미장 핵심 섹터: {session_data.get('us_sector_focus', DATA_MISSING)}",
+        f"- 산업 관련 이슈: {session_data.get('industry_major_issues', DATA_MISSING)}",
+        f"- 산업 관련 이슈 해석: {session_data.get('industry_major_issues_view', ANALYSIS_PENDING)}",
+        f"- 오늘/당일 핵심 변수: {market_summary.get('drivers', ANALYSIS_PENDING)}",
+    ]
+    return "\n".join(lines)
+
+
+def build_top_news_lines(report_data: dict | None = None, limit: int = 3) -> list[str]:
     sectors = (report_data or {}).get("sectors", {})
     items: list[tuple[str, str]] = []
     for sector, data in sectors.items():
@@ -128,7 +181,24 @@ def build_top_news_lines(report_data: dict | None = None) -> list[str]:
                 text = f"  - {sector}: {headline} | {source} | {published_at} | {collection_path}"
         items.append((published_at, text))
     items.sort(key=lambda item: item[0], reverse=True)
-    return [item[1] for item in items[:3]]
+    return [item[1] for item in items[:limit]]
+
+
+def build_morning_top_news_section(report_data: dict | None = None) -> str:
+    session_data = (report_data or {}).get("session", {})
+    lines = [
+        "### 오늘 가장 중요한 뉴스 10개",
+        "",
+        f"- 해외 주요 뉴스: {session_data.get('overseas_major_news', DATA_MISSING)}",
+        f"- 해외 주요 뉴스 해석: {session_data.get('overseas_major_news_view', ANALYSIS_PENDING)}",
+        "",
+    ]
+    top_news_lines = build_top_news_lines(report_data, limit=10)
+    if top_news_lines:
+        lines.extend(top_news_lines)
+    else:
+        lines.append(f"- {DATA_MISSING}")
+    return "\n".join(lines)
 
 
 def build_coverage_section(report_data: dict | None = None) -> str:
@@ -167,7 +237,7 @@ def build_common_sections(report_data: dict | None = None) -> str:
     missing_reasons = common.get("missing_reasons", {})
     korea_reference_date = (report_data or {}).get("korea_reference_date", DATA_MISSING)
     sections = ["<!-- TODO: API 연동 시 지수/금리/환율/원자재/수급 데이터를 자동 주입할 것. -->"]
-    if session_name != "morning":
+    if session_name not in {"morning", "closing"}:
         sections.extend(
             [
                 "## 시장 요약",
@@ -196,6 +266,21 @@ def build_common_sections(report_data: dict | None = None) -> str:
             f"- 금 시세: {comparison_text(fx_commodities.get('gold_snapshot', {}))}",
             f"- 해석: {fx_commodities.get('analysis', ANALYSIS_PENDING)}",
             "",
+        ]
+    )
+    if session_name == "closing":
+        sections.extend(
+            [
+                "## 시장 요약",
+                "",
+                f"- 시장 구조 해석: {market_summary.get('structure', ANALYSIS_PENDING)}",
+                f"- 오늘/당일 핵심 변수: {market_summary.get('drivers', ANALYSIS_PENDING)}",
+                f"- 투자 심리: {market_summary.get('sentiment', ANALYSIS_PENDING)}",
+                "",
+            ]
+        )
+    sections.extend(
+        [
             "## 한국시장",
             "",
             f"- KOSPI: {korea_market.get('kospi', DATA_MISSING)}",
@@ -334,35 +419,10 @@ def build_morning_summary_section(report_data: dict | None = None) -> str:
     lines = [
         "## 시작 요약",
         "",
-        f"- 시장 점수: {session_data.get('market_score', DATA_MISSING)}",
-        f"- 공격 / 중립 / 방어: {session_data.get('stance', DATA_MISSING)}",
-        f"- 시장 구조 해석: {market_summary.get('structure', ANALYSIS_PENDING)}",
         f"- 오늘/당일 핵심 변수: {market_summary.get('drivers', ANALYSIS_PENDING)}",
         f"- 투자 심리: {market_summary.get('sentiment', ANALYSIS_PENDING)}",
         f"- 왜 {session_data.get('stance', DATA_MISSING)}인지: {session_data.get('stance_reason', ANALYSIS_PENDING)}",
-        "- 오늘 가장 중요한 뉴스 3개:",
     ]
-    top_news_lines = build_top_news_lines(report_data)
-    if top_news_lines:
-        lines.extend(top_news_lines)
-    else:
-        lines.append(f"  - {DATA_MISSING}")
-    lines.extend(
-        [
-            f"- 해외 주요 뉴스: {session_data.get('overseas_major_news', DATA_MISSING)}",
-            f"- 해외 주요 뉴스 해석: {session_data.get('overseas_major_news_view', ANALYSIS_PENDING)}",
-            f"- 산업 관련 이슈: {session_data.get('industry_major_issues', DATA_MISSING)}",
-            f"- 산업 관련 이슈 해석: {session_data.get('industry_major_issues_view', ANALYSIS_PENDING)}",
-            f"- 현재 돈이 몰리는 곳: {session_data.get('capital_flow_now', DATA_MISSING)}",
-            f"- 미장 핵심 섹터: {session_data.get('us_sector_focus', DATA_MISSING)}",
-            f"- 오늘 예상 섹터: {session_data.get('expected_sector_today', DATA_MISSING)}",
-            f"- 예상 섹터 근거: {session_data.get('expected_sector_reason', ANALYSIS_PENDING)}",
-            f"- ETF 핵심 시나리오: {session_data.get('etf_core', ANALYSIS_PENDING)}",
-            f"- 절대 하지 말아야 할 행동: {session_data.get('dont_do', DATA_MISSING)}",
-            f"- 근거 점수: {session_data.get('evidence_score', DATA_MISSING)}",
-            f"- 근거 품질 코멘트: {session_data.get('evidence_comment', ANALYSIS_PENDING)}",
-        ]
-    )
     return "\n".join(lines)
 
 
