@@ -225,7 +225,7 @@ def build_coverage_section(report_data: dict | None = None) -> str:
     return "\n".join(sections)
 
 
-def build_common_sections(report_data: dict | None = None) -> str:
+def build_common_sections(report_data: dict | None = None, *, include_flow_rankings: bool = True) -> str:
     common = (report_data or {}).get("common", {})
     session_name = (report_data or {}).get("session_name")
     market_summary = common.get("market_summary", {})
@@ -291,7 +291,7 @@ def build_common_sections(report_data: dict | None = None) -> str:
             f"- 미수집 사유: {missing_reasons.get('korea_index', DATA_MISSING)}",
         ]
     )
-    if session_name in {"morning", "closing"}:
+    if include_flow_rankings and session_name in {"morning", "closing"}:
         sections.extend(
             [
                 "",
@@ -658,26 +658,13 @@ def build_closing_decision_sections(report_data: dict | None = None) -> str:
     closing = (report_data or {}).get("closing", {})
     return "\n".join(
         [
-            "## 오늘의 결론",
+            "## 종가 기준 결론",
             "",
-            f"- 시장 점수: {closing.get('market_score', DATA_MISSING)}",
-            f"- 현대차 점수: {closing.get('hyundai_score', DATA_MISSING)}",
-            f"- 내일 공격/중립/방어 판단: {closing.get('stance', ANALYSIS_PENDING)}",
-            f"- 내일 가장 중요한 체크포인트 3개: {closing.get('top3', ANALYSIS_PENDING)}",
-            f"- 중기 핵심 체크포인트: {closing.get('must_watch', ANALYSIS_PENDING)}",
-            "",
-            "## 내일 주문 전략",
-            "",
-            f"- 상승 시: {closing.get('upside_order', ANALYSIS_PENDING)}",
-            f"- 횡보 시: {closing.get('flat_order', ANALYSIS_PENDING)}",
-            f"- 하락 시: {closing.get('downside_order', ANALYSIS_PENDING)}",
-            f"- 절대 하지 말아야 할 행동: {closing.get('dont_do', ANALYSIS_PENDING)}",
-            "",
-            "## 시계열 시나리오 요약",
-            "",
-            f"- 내일: {closing.get('tomorrow_outlook', ANALYSIS_PENDING)}",
-            f"- 다음주: {closing.get('next_week_outlook', ANALYSIS_PENDING)}",
-            f"- 1개월: {closing.get('one_month_outlook', ANALYSIS_PENDING)}",
-            f"- 6개월: {closing.get('six_month_outlook', ANALYSIS_PENDING)}",
+            f"- 오늘 장 요약: {closing.get('market_day_summary', ANALYSIS_PENDING)}",
+            f"- 움직인 이유: {closing.get('market_move_reason', ANALYSIS_PENDING)}",
+            f"- 오늘 확인된 약점: {closing.get('market_problem', ANALYSIS_PENDING)}",
+            f"- 종가 기준 심리 해석: {closing.get('market_sentiment_view', ANALYSIS_PENDING)}",
+            f"- 현대차 해석: {closing.get('hyundai_day_view', ANALYSIS_PENDING)}",
+            f"- 다음 거래일 핵심 체크포인트: {closing.get('must_watch', ANALYSIS_PENDING)}",
         ]
     )

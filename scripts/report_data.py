@@ -1326,7 +1326,7 @@ class ReportDataBuilder:
         }
         stock_client = _ensure_pykrx_stock()
         if stock_client is None:
-            result["reason"] = f"pykrx 미설치 또는 import 실패: {PYKRX_IMPORT_ERROR or '원인 미상'}"
+            result["reason"] = PYKRX_IMPORT_ERROR or "pykrx import 실패"
             return result
         if not os.getenv("KRX_ID") or not os.getenv("KRX_PW"):
             result["reason"] = "PyKRX 투자자 수급 조회에는 KRX_ID, KRX_PW가 필요함"

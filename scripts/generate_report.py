@@ -12,6 +12,7 @@ from report_sections import (
     build_closing_decision_sections,
     build_common_sections,
     build_coverage_section,
+    build_flow_ranking_section,
     build_hyundai_section,
     build_morning_summary_section,
     build_morning_top_news_section,
@@ -102,7 +103,7 @@ def build_content(session: str, target_date: date) -> str:
         sections.extend(
             [
                 *( [summary_block, ""] if summary_block else [] ),
-                build_common_sections(report_data),
+                build_common_sections(report_data, include_flow_rankings=session != "closing"),
                 "",
             ]
         )
@@ -115,6 +116,13 @@ def build_content(session: str, target_date: date) -> str:
     elif session == "closing":
         sections.extend(
             [
+                build_closing_decision_sections(report_data),
+                "",
+                build_flow_ranking_section(
+                    report_data.get("common", {}).get("flow_rankings", {}),
+                    report_data.get("common", {}).get("missing_reasons", {}).get("flow_rankings", "데이터 미수집"),
+                ),
+                "",
                 build_hyundai_section(report_data),
             ]
         )
